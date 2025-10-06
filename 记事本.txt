@@ -28,3 +28,5 @@ python： 力扣，图像处理库(动态规划和递归+记忆化可能比较�
 鸢尾花的识别 数据集在哪里   半导体物理  光纤通信 pn结
 
 jupyter notebook  //markdown  //latex
+无穷限积分交换次序
+看python数组的网课
