@@ -18,3 +18,4 @@ jupyter notebook  //markdown  //latex
 无穷限积分交换次序
 python numpy matplotlib pandas  信号与系统  机器学习  数字信号处理  数字图像处理
 codev  研究生课程学习(三大光学)  光谱共焦论文  拟合
+python做做仿真
