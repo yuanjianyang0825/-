@@ -16,10 +16,10 @@ N  = 13854                       # 针孔总数（第14面实测峰值数）
 Δz = np.linspace(2.9, 0, 30)     # 30 个已知高度（mm）
 
 # ========== 2. 读 30 张 PNG ==========
-imgs = np.stack([imageio.imread(f).astype(np.float32) @ [0.299, 0.587, 0.114]
+imgs = np.stack([imageio.imread(f).astype(np.float32) @ [0.3, 0.3, 0.4]
                  for f in files])   #读图后直接转化RGB → 灰度
 
-ref = imgs[14]
+ref = imgs[14]   # 以14帧作为参考帧
 
 # 直接返回 (row, col) 即 (y, x)
 coords = peak_local_max(ref,
@@ -28,9 +28,6 @@ coords = peak_local_max(ref,
 
 
 # ========== 4. 逐帧滑动 ROI（半径不变，中心随光斑移动） ==========
-# ========== 4. 逐帧滑动 ROI（半径不变，中心随光斑移动） ==========
-peaks = np.empty((N, 30))
-radius = 9
 
 from scipy.optimize import curve_fit
 
@@ -57,10 +54,13 @@ def fit_gauss_center(line):
         return center_of_mass(line)[0]
 
 # ---------- 第 14 帧 ----------
+peaks = np.empty((N, 30))
+radius = 9
 for k in range(N):
     y0, x0 = coords[k]
     y1, y2 = max(y0 - radius, 0), y0 + radius + 1
-    roi = imgs[14, y1:y2, x0 - radius:x0 + radius + 1]
+    x1, x2 = max(x0 - radius, 0), x0 + radius + 1
+    roi = imgs[14, y1:y2, x1:x2]
     # 对 y 方向每一行求和，得到 1-D 信号
     proj = roi.sum(axis=1)
     dy = fit_gauss_center(proj)
@@ -73,7 +73,9 @@ for i in range(13, -1, -1):
         x_last = coords[k, 1]
         y1 = max(int(y_last) - radius, 0)
         y2 = int(y_last) + radius + 1
-        roi = imgs[i, y1:y2, x_last - radius:x_last + radius + 1]
+        x1 = max(x_last - radius, 0)
+        x2 = x_last + radius + 1
+        roi = imgs[i, y1:y2, x1:x2]
         proj = roi.sum(axis=1)
         dy = fit_gauss_center(proj)
         peaks[k, i] = y1 + dy
@@ -85,7 +87,9 @@ for i in range(15, 30):
         x_last = coords[k, 1]
         y1 = max(int(y_last) - radius, 0)
         y2 = int(y_last) + radius + 1
-        roi = imgs[i, y1:y2, x_last - radius:x_last + radius + 1]
+        x1 = max(x_last - radius, 0)
+        x2 = x_last + radius + 1
+        roi = imgs[i, y1:y2, x1:x2]
         proj = roi.sum(axis=1)
         dy = fit_gauss_center(proj)
         peaks[k, i] = y1 + dy
@@ -124,4 +128,5 @@ np.savez('calib_table_14k_png.npz',
 print('标定完成！已生成 calib_table_14k_png.npz')
 miss = np.isnan(peaks).sum(axis=1)   # 每孔丢失帧数
 if miss.max() > 0:
+
     print('警告：有', (miss > 0).sum(), '个光斑在部分帧丢失！')
