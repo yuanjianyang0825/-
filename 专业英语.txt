@@ -1,8 +1,0 @@
-non-uniform     adj.不均匀的；变化的；不（非）一致的；不等的；非均质的
-under-sampled    欠采样
-low-coherence scanning interferometry   低相干扫描干涉测量
-mitigate    减轻 缓和
-inherent    固有的
-texture  质地
-modulate  控制 调节
-Piezoelectric ceramic  压电陶瓷（PZT)
