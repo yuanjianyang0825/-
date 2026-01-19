@@ -6,6 +6,7 @@ import glob;
 from tqdm import tqdm;
 import open3d as o3d;
 
+# 提取文件-排序-读取第一张图并转灰度-黑色增长增宽图像-旋转图像并转BGR
 all_bmp_files = glob.glob("./calib_2/*.bmp")
 file_list = sorted(all_bmp_files, key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
 deg = -3.05
