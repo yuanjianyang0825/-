@@ -1,11 +1,265 @@
-我搭建了一个光谱共焦系统，原理是这样的，一个led光源通过积分球匀光后出射照在一个有14000个孔的针孔阵列板上，从各个孔发射出来的光照射在物体上，物体反射回来的光进入一个与原阵列板光学共轭的另一个相同的阵列板，再出射到光谱仪，光谱仪通过色散透镜分光，在相机上呈现出14000个光斑，色散方向在像面上是沿着y轴的，然后标定的时候直接用物体对应的高度和光斑质心在像素上的位置进行对应。现在呢我想验证一下，在同一高度位置，探测器所接受的光斑位置是否会有漂移现象，所以我用平面反射镜在同一位置采集了五十张照片，想看一下光斑会不会漂移。我的想法是把每张图所有光斑位置求个平均，对比一下50张图的平均位置差别有多大，这个想法怎么样？你还有更好的想法吗？
+# -*- coding: utf-8 -*-
+"""
+基于 calib_table_final.npz 的三维重建脚本（适配旋转阵列）
+- 使用查表+插值法反推高度
+- 自适应 X 匹配容忍度（基于最小间距）
+- 适用于：Y方向位移大、X基本不变的旋转针孔阵列系统
+"""
 
+import numpy as np
+import imageio.v2 as imageio
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata, interp1d
+from skimage.feature import peak_local_max
+from scipy.ndimage import center_of_mass
+from scipy.optimize import curve_fit
+import os
 
+# ==================== 配置区 ====================
+sample_img_path = r'C:\Users\10574\Desktop\样品图\sample.bmp'  # ← 修改为你的样品图像路径
+calib_file = r'C:\Users\10574\Desktop\calib_table_final.npz'   # 标定表路径
+dark_dir = r'C:\Users\10574\Desktop\暗场图'                   # 暗场图路径
 
+# =================================================
 
+# ---------- 读图转灰度 ----------
+def to_gray(img):
+    img = img.astype(np.float32)
+    if img.ndim == 3:
+        return img[:, :, 0]  # 直接取 R 通道（等于 G=B）
+    elif img.ndim == 2:
+        return img
+    else:
+        raise ValueError("无效图像维度")
 
+# ---------- 高斯拟合函数 ----------
+def gauss_1d(x, A, mu, sigma, B):
+    return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2) + B
 
+def gauss_center_1d(line):
+    x = np.arange(len(line), dtype=float)
+    try:
+        A0 = line.max() - line.min()
+        mu0 = (line * x).sum() / line.sum()
+        sig0 = 2.0
+        B0 = line.min()
+        popt, _ = curve_fit(gauss_1d, x, line, p0=[A0, mu0, sig0, B0], maxfev=1000)
+        return popt[1]
+    except (RuntimeError, ValueError):
+        return (line * x).sum() / line.sum()
 
+# ==================== 主流程 ====================
 
+# 1. 加载标定数据
+print("正在加载标定数据...")
+calib = np.load(calib_file, allow_pickle=True)
+x0_calib = calib['x0']          # 参考帧 X 坐标
+y0_calib = calib['y0']          # 参考帧 Y 坐标
+peaks = calib['peaks']          # (N, 30) 所有帧的 Y 位置
+heights = calib['heights']      # (30,) 标定高度
+N = calib['N'].item()
+print(f"✅ 已加载 {N} 个光斑的标定数据")
 
+# 2. 构建反向插值函数（z = f(y)）
+print("正在构建高度反推函数...")
+interp_funcs = []
+for k in range(N):
+    y_vals = peaks[k]
+    valid = ~np.isnan(y_vals)
+    if np.sum(valid) < 2:
+        interp_funcs.append(None)
+    else:
+        # 确保 y 单调（光谱共焦应满足）
+        y_clean = y_vals[valid]
+        z_clean = heights[valid]
+        sort_idx = np.argsort(y_clean)
+        y_clean = y_clean[sort_idx]
+        z_clean = z_clean[sort_idx]
+        # 使用 cubic 插值，外推用最近值
+        f = interp1d(y_clean, z_clean, kind='cubic', fill_value="extrapolate")
+        interp_funcs.append(f)
 
+# 3. 加载暗场背景
+print("正在加载暗场背景...")
+dark_files = [os.path.join(dark_dir, f) for f in os.listdir(dark_dir) if f.endswith('.bmp')][:10]
+bg_imgs = [to_gray(imageio.imread(f)) for f in dark_files]
+bg_mean = np.mean(np.stack(bg_imgs), axis=0)
+
+# 4. 加载样品图像
+print("正在加载样品图像...")
+if not os.path.exists(sample_img_path):
+    raise FileNotFoundError(f"❌ 找不到图像: {sample_img_path}")
+sample_img = to_gray(imageio.imread(sample_img_path))
+img = np.clip(sample_img - bg_mean, 0, None)
+print(f"✅ 图像尺寸: {img.shape}")
+
+# 5. 检测光斑粗略位置
+peaks_new = peak_local_max(
+    img,
+    min_distance=20,
+    threshold_abs=50  # 背景扣除后可降低阈值
+)
+print(f"🔍 检测到 {len(peaks_new)} 个光斑候选点")
+
+if len(peaks_new) == 0:
+    raise ValueError("⚠️ 未检测到任何光斑，请检查图像质量")
+
+# 6. 亚像素精确定位 Y
+radius = 9
+y_subpix = np.zeros(len(peaks_new))
+
+for i, (y_int, x_int) in enumerate(peaks_new):
+    y1 = max(int(y_int) - radius, 0)
+    y2 = int(y_int) + radius + 1
+    x1 = max(int(x_int) - radius, 0)
+    x2 = int(x_int) + radius + 1
+    roi = img[y1:y2, x1:x2]
+    
+    if roi.size == 0 or roi.sum() < 1e-3:
+        y_subpix[i] = np.nan
+        continue
+    
+    proj = roi.sum(axis=1)
+    dy = gauss_center_1d(proj)
+    y_subpix[i] = y1 + dy
+
+new_x = peaks_new[:, 1]        # 检测到的 X
+new_y = peaks_new[:, 0]        # 检测到的 Y（整像素，用于显示）
+y_measured = y_subpix          # 亚像素 Y
+
+# 7. 自适应 X 匹配容忍度（针对旋转阵列）
+sorted_x = np.sort(x0_calib)
+x_diffs = np.diff(sorted_x)
+x_min_spacing = np.min(x_diffs)
+# 安全下限：避免过小
+x_min_spacing = max(x_min_spacing, 5.0)
+x_tolerance = x_min_spacing * 0.8  # 0.8 是经验比例
+
+print(f"📊 X 最小间距: {x_min_spacing:.1f} 像素")
+print(f"📊 X 匹配容忍度: {x_tolerance:.1f} 像素")
+
+# 8. 两级匹配：先 X 近 → 再 Y 最近
+matches = -np.ones(len(new_x), dtype=int)
+used_calib_indices = set()  # 防止多对一匹配
+
+for i in range(len(new_x)):
+    xi = new_x[i]
+    yi = y_measured[i]
+    if np.isnan(yi):
+        continue
+
+    # Step 1: 找 X 在容忍范围内的候选
+    candidate_mask = (x0_calib >= xi - x_tolerance) & (x0_calib <= xi + x_tolerance)
+    candidate_indices = np.where(candidate_mask)[0]
+    
+    if len(candidate_indices) == 0:
+        continue
+
+    # Step 2: 在候选中找 Y 最接近的
+    y0_candidates = y0_calib[candidate_indices]
+    dy = np.abs(y0_candidates - yi)
+    best_idx_in_candidates = np.argmin(dy)
+    matched_k = candidate_indices[best_idx_in_candidates]
+
+    # 防止重复匹配
+    if matched_k in used_calib_indices:
+        continue
+        
+    matches[i] = matched_k
+    used_calib_indices.add(matched_k)
+
+num_matched = np.sum(matches >= 0)
+print(f"✅ 成功匹配 {num_matched} 个光斑")
+
+# 9. 解算高度 Z（使用插值函数）
+Z_heights = np.full(len(matches), np.nan)
+
+for i, match_idx in enumerate(matches):
+    if match_idx < 0 or np.isnan(y_measured[i]):
+        continue
+    if interp_funcs[match_idx] is not None:
+        try:
+            Z_heights[i] = interp_funcs[match_idx](y_measured[i])
+        except:
+            Z_heights[i] = np.nan
+
+# 10. 提取有效数据
+valid_mask = ~np.isnan(Z_heights)
+x_coords = new_x[valid_mask].astype(int)
+y_coords = new_y[valid_mask].astype(int)
+z_values = Z_heights[valid_mask]
+
+if len(z_values) == 0:
+    raise ValueError("❌ 未能解算出任何有效高度！")
+
+print(f"📊 有效高度点数: {len(z_values)}")
+print(f"📊 高度范围: {z_values.min():.3f} ~ {z_values.max():.3f} mm")
+
+# 11. 插值生成连续高度图
+if len(z_values) > 3:  # 至少4点才能cubic插值
+    xi_grid = np.linspace(x_coords.min(), x_coords.max(), 500)
+    yi_grid = np.linspace(y_coords.min(), y_coords.max(), 500)
+    Xi, Yi = np.meshgrid(xi_grid, yi_grid)
+    
+    Zi = griddata(
+        points=(x_coords, y_coords),
+        values=z_values,
+        xi=(Xi, Yi),
+        method='cubic',
+        fill_value=np.nan
+    )
+else:
+    Zi = None
+
+# 12. 可视化
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+fig = plt.figure(figsize=(14, 10))
+
+# 原始图像 + 检测点
+plt.subplot(2, 2, 1)
+plt.imshow(img, cmap='gray')
+plt.plot(x_coords, y_coords, 'r.', markersize=2, alpha=0.8)
+plt.title("检测到的光斑位置")
+plt.axis('off')
+
+# 散点高度分布
+plt.subplot(2, 2, 2)
+sc = plt.scatter(x_coords, y_coords, c=z_values, cmap='Spectral_r', s=10)
+plt.colorbar(sc, label='高度 Z (mm)')
+plt.title("各光斑高度分布")
+plt.axis('off')
+
+# 插值形貌
+if Zi is not None:
+    plt.subplot(2, 1, 2)
+    im = plt.imshow(Zi, cmap='Spectral_r', 
+                    extent=[xi_grid.min(), xi_grid.max(), yi_grid.min(), yi_grid.max()],
+                    origin='lower')
+    plt.colorbar(im, label='高度 Z (mm)')
+    plt.title("重建的三维表面形貌（插值后）")
+    plt.xlabel("图像 X 像素")
+    plt.ylabel("图像 Y 像素")
+
+plt.tight_layout()
+plt.show()
+
+# 13. 保存结果
+save_data = {
+    'x': x_coords,
+    'y': y_coords,
+    'z': z_values,
+    'params': {
+        'x_tolerance': x_tolerance,
+        'x_min_spacing': x_min_spacing,
+        'N_matched': num_matched,
+        'N_total': N
+    }
+}
+if Zi is not None:
+    save_data.update({'Xi': Xi, 'Yi': Yi, 'Zi': Zi})
+
+np.savez('reconstructed_3d_surface.npz', **save_data)
+print("🎉 三维形貌重建完成！")
+print(f"   数据已保存至: reconstructed_3d_surface.npz")
