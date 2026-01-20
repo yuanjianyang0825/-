@@ -64,6 +64,8 @@ import open3d as o3d;
 points_re = []
 file = "./recon/11.bmp"
 # file = "./imgs3/10.bmp"
+
+# 样品图同样读图按之前一样的方式处理
 img_re = cv2.imread(file, cv2.IMREAD_GRAYSCALE)
 img_re = cv2.copyMakeBorder(img_re,1000,1000,1000,1000,cv2.BORDER_CONSTANT)
 center = (0,0)
@@ -81,13 +83,13 @@ for i in range(1, num_labels):
     ok_blob_num += 1
     x, y, w, h, area = stats[i]
     cx, cy = centroids[i]
-    cv2.circle(img_re_color, (int(cx), int(cy)), 1, (0, 0, 255), -1)
-    points_re.append(np.array([cx, cy]))
+    cv2.circle(img_re_color, (int(cx), int(cy)), 1, (0, 0, 255), -1)  # 样品图上画质心
+    points_re.append(np.array([cx, cy]))  # points_re中存入每个质心坐标
 print("ok_blob_num: ",ok_blob_num)
 points_re = np.array(points_re)
 
 ## corresponding map
-ref_points = points_channel[0]
+ref_points = points_channel[0]  # 取第0帧标定图
 from scipy.spatial import cKDTree
 pc = []
 
