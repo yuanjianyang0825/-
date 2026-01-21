@@ -71,7 +71,7 @@ def fit_order(z, y, max_order=3, thresh=0.05):
 # 1. 读取标定图像
 print("正在加载标定图像...")
 os.chdir(calib_dir)
-calib_files = sorted(glob.glob('*.bmp'))
+calib_files = sorted(glob.glob('*.bmp'), key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
 imgs = np.stack([to_gray(imageio.imread(f)) for f in calib_files])
 H, W = imgs.shape[1], imgs.shape[2]
 print(f"✅ 标定图像已加载，形状: {imgs.shape}")
