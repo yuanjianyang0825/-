@@ -18,15 +18,15 @@ import open3d as o3d
 
 # ==================== 配置区 ====================
 # 待测样品图像路径
-sample_img_path = r"C:\Users\A\Desktop\sample.bmp"  # ← 修改为你的样品图像路径
+sample_img_path = r"C:\Users\A\Desktop\test\13.bmp"  # ← 修改为你的样品图像路径
 
 # 标定表路径
-calib_file = r"C:\Users\A\Desktop\calib_table_final.npz"
+calib_file = r"C:\Users\A\Desktop\biaoding\calib_table_final.npz"
 
 # 匹配参数
 x_tolerance = 3    # X方向容忍度（像素）
-y_min_offset = 0   # Y方向最小偏移（像素）
-y_max_offset = 100 # Y方向最大偏移（像素）
+y_min_offset = -100   # Y方向最小偏移（像素）
+y_max_offset = 0 # Y方向最大偏移（像素）
 
 # ROI参数
 roi_radius = 9
@@ -189,15 +189,24 @@ x_coords = sample_subpixel_valid[valid_z_mask, 0]
 y_coords = sample_subpixel_valid[valid_z_mask, 1]
 z_coords = z_heights[valid_z_mask]
 
-if len(z_coords) == 0:
+# 像素坐标转换为毫米
+pixel_size_mm = 3.45 / 1000  # 3.45 微米 = 0.00345 毫米
+x_coords_mm = x_coords * pixel_size_mm
+y_coords_mm = y_coords * pixel_size_mm
+z_coords_mm = z_coords  # 已经是毫米
+
+if len(z_coords_mm) == 0:
     raise ValueError("❌ 未能反推出任何有效高度！")
 
-print(f"📊 有效高度点数: {len(z_coords)}")
-print(f"📊 高度范围: {z_coords.min():.3f} ~ {z_coords.max():.3f} mm")
+print(f"📊 有效高度点数: {len(z_coords_mm)}")
+print(f"📊 X范围: {x_coords_mm.min():.3f} ~ {x_coords_mm.max():.3f} mm")
+print(f"📊 Y范围: {y_coords_mm.min():.3f} ~ {y_coords_mm.max():.3f} mm")
+print(f"📊 Z范围: {z_coords_mm.min():.3f} ~ {z_coords_mm.max():.3f} mm")
+
 
 # 8. 生成3D点云
 print("正在生成3D点云...")
-points_3d = np.column_stack((x_coords, y_coords, z_coords))
+points_3d = np.column_stack((x_coords_mm, y_coords_mm, z_coords_mm))
 
 # 创建Open3D点云
 pcd = o3d.geometry.PointCloud()
@@ -205,7 +214,13 @@ pcd.points = o3d.utility.Vector3dVector(points_3d)
 
 # 9. 可视化
 print("正在可视化3D点云...")
-o3d.visualization.draw_geometries([pcd], window_name="Surface Reconstruction")
+# 创建坐标系（现在所有坐标都是毫米，所以 size 用毫米单位）
+coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+    size=15.0,  # 1mm 长的坐标轴，根据你的实际尺寸调整
+    origin=[0, 0, 0]
+)
+
+o3d.visualization.draw_geometries([pcd, coordinate_frame], window_name="Surface Reconstruction")
 
 # 10. 保存结果
 output_file = os.path.splitext(os.path.basename(sample_img_path))[0] + "_reconstruction.npz"
