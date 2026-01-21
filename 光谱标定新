@@ -1,5 +1,5 @@
 """
-- 量程：0–2.9 mm，30 张等间隔高度图像
+- 量程：0–2.5 mm，26 张等间隔高度图像
 """
 
 import os, glob
@@ -12,11 +12,10 @@ from numpy.polynomial import Polynomial
 
 # ==================== 配置区 ====================
 # 路径配置（请按实际修改）
-calib_dir = r'C:\Users\10574\Desktop\标定图'   # 30张不同高度的标定图像（BMP）
-dark_dir  = r'C:\Users\10574\Desktop\暗场图'   # 暗场图像（BMP）
+calib_dir = r"C:\Users\A\Desktop\biaoding"   # 26张不同高度的标定图像（BMP）
 
 # 标定参数
-heights_mm = np.linspace(2.9, 0, 30)  # 已知高度 (mm)
+heights_mm = np.linspace(2.5, 0, 26)  # 已知高度 (mm)
 roi_radius = 9                        # ROI 半径（像素）
 gauss_fallback = True                 # 高斯拟合失败时回退到质心
 
@@ -25,12 +24,7 @@ gauss_fallback = True                 # 高斯拟合失败时回退到质心
 # ---------- 读图转灰度 ----------
 def to_gray(img):
     img = img.astype(np.float32)
-    if img.ndim == 3:
-        return img[:, :, 0]  # 直接取 R 通道（等于 G=B）
-    elif img.ndim == 2:
-        return img
-    else:
-        raise ValueError("无效图像维度")
+    return img[:, :, 0]  # 直接取 R 通道（等于 G=B）
 
 # ---------- 高斯拟合函数 ----------
 def gauss_1d(x, A, mu, sigma, B):
@@ -74,85 +68,75 @@ def fit_order(z, y, max_order=3, thresh=0.05):
 
 # ==================== 主流程 ====================
 
-# 1. 读取暗场背景
-print("正在加载暗场图像...")
-os.chdir(dark_dir)
-dark_files = sorted(glob.glob('*.bmp'))
-assert len(dark_files) >= 10, "暗场图不足10张"
-bg_imgs = [to_gray(imageio.imread(f)) for f in dark_files[:10]]
-bg_mean = np.mean(np.stack(bg_imgs), axis=0)
-print(f"✅ 背景已计算，形状: {bg_mean.shape}")
-
-# 2. 读取标定图像
+# 1. 读取标定图像
 print("正在加载标定图像...")
 os.chdir(calib_dir)
 calib_files = sorted(glob.glob('*.bmp'))
-assert len(calib_files) == 30, f"需要30张标定图，找到 {len(calib_files)} 张"
-imgs_raw = np.stack([to_gray(imageio.imread(f)) for f in calib_files])
-H, W = imgs_raw.shape[1], imgs_raw.shape[2]
-imgs = np.clip(imgs_raw - bg_mean, 0, None)
+imgs = np.stack([to_gray(imageio.imread(f)) for f in calib_files])
+H, W = imgs.shape[1], imgs.shape[2]
 print(f"✅ 标定图像已加载，形状: {imgs.shape}")
 
-# 3. 提取参考帧亮点
-ref_img = imgs[14]  # 中间高度作为参考
+# 2. 提取参考帧亮点
+ref_img = imgs[0]  # 第0帧作为参考
 coords = peak_local_max(ref_img, min_distance=20, threshold_abs=50)
 N = coords.shape[0]
 print(f"🔍 检测到 {N} 个有效光斑")
 
-# 4. 初始化峰值位置数组
-peaks = np.full((N, 30), np.nan, dtype=np.float32)
+# 3. 初始化峰值位置数组
+peaks = np.full((N, 26), np.nan, dtype=np.float32)
 
-# 5. 处理参考帧（第14帧）
+# 4. 处理参考帧（第0帧）- 计算亚像素 X 和 Y
 print("正在处理参考帧...")
+subpixel_coords = np.full((N, 2), np.nan, dtype=np.float32)  # 存储亚像素坐标
+
 for k in range(N):
-    y0, x0 = coords[k]
+    y0, x0 = coords[k]  # 整像素初始位置
     y1 = max(int(y0) - roi_radius, 0)
     y2 = min(int(y0) + roi_radius + 1, H)
     x1 = max(int(x0) - roi_radius, 0)
     x2 = min(int(x0) + roi_radius + 1, W)
-    roi = imgs[14, y1:y2, x1:x2]
+    roi = imgs[0, y1:y2, x1:x2]
+    
     if roi.size > 0 and roi.sum() > 1e-3:
-        proj = roi.sum(axis=1)
-        dy = fit_gauss_center(proj)
-        peaks[k, 14] = y1 + dy
+        # 沿 Y 方向积分得到 X 方向分布
+        proj_x = roi.sum(axis=0)  # shape: (width,)
+        # 沿 X 方向积分得到 Y 方向分布  
+        proj_y = roi.sum(axis=1)  # shape: (height,)
+        
+        # 计算亚像素坐标
+        dx = fit_gauss_center(proj_x)  # X 方向亚像素偏移
+        dy = fit_gauss_center(proj_y)  # Y 方向亚像素偏移
+        
+        subpixel_x = x1 + dx
+        subpixel_y = y1 + dy
+        
+        subpixel_coords[k] = [subpixel_x, subpixel_y]
+        peaks[k, 0] = subpixel_y  # 保存亚像素 Y
 
-# 6. 向前追踪（13 → 0）
-print("正在向前追踪 (13→0)...")
-for i in range(13, -1, -1):
+
+# 5. 向后追踪（1 → 25）
+print("正在向后追踪 (1→25)...")
+for i in range(1, 26):
     for k in range(N):
-        if np.isnan(peaks[k, i+1]):
+        if np.isnan(peaks[k, i-1]) or np.isnan(subpixel_coords[k, 0]):
             continue
-        y_last = peaks[k, i+1]
-        x_last = coords[k, 1]
+            
+        # 使用亚像素坐标作为 ROI 中心
+        y_last = peaks[k, i-1] - 2      # 亚像素 Y
+        x_last = subpixel_coords[k, 0]  # 亚像素 X
+        
         y1 = max(int(y_last) - roi_radius, 0)
         y2 = min(int(y_last) + roi_radius + 1, H)
         x1 = max(int(x_last) - roi_radius, 0)
         x2 = min(int(x_last) + roi_radius + 1, W)
+        
         roi = imgs[i, y1:y2, x1:x2]
         if roi.size > 0 and roi.sum() > 1e-3:
-            proj = roi.sum(axis=1)
-            dy = fit_gauss_center(proj)
+            proj_y = roi.sum(axis=1)
+            dy = fit_gauss_center(proj_y)
             peaks[k, i] = y1 + dy
 
-# 7. 向后追踪（15 → 29）
-print("正在向后追踪 (15→29)...")
-for i in range(15, 30):
-    for k in range(N):
-        if np.isnan(peaks[k, i-1]):
-            continue
-        y_last = peaks[k, i-1]
-        x_last = coords[k, 1]
-        y1 = max(int(y_last) - roi_radius, 0)
-        y2 = min(int(y_last) + roi_radius + 1, H)
-        x1 = max(int(x_last) - roi_radius, 0)
-        x2 = min(int(x_last) + roi_radius + 1, W)
-        roi = imgs[i, y1:y2, x1:x2]
-        if roi.size > 0 and roi.sum() > 1e-3:
-            proj = roi.sum(axis=1)
-            dy = fit_gauss_center(proj)
-            peaks[k, i] = y1 + dy
-
-# 8. 多项式拟合
+# 6. 多项式拟合
 print("正在拟合标定曲线...")
 coeffs = []
 orders = np.empty(N, dtype=int)
@@ -162,7 +146,7 @@ for k in range(N):
     coeffs.append(p.convert().coef[::-1])  # 低次 → 高次
     orders[k] = deg
 
-# 9. 保存结果
+# 7. 保存结果
 print("正在保存标定表...")
 coeffs_np = np.empty(len(coeffs), dtype=object)
 coeffs_np[:] = coeffs
@@ -170,13 +154,13 @@ coeffs_np[:] = coeffs
 np.savez('calib_table_final.npz',
          coeffs=coeffs_np,
          orders=orders,
-         x0=coords[:, 1],
-         y0=coords[:, 0],
+         x0=subpixel_coords[:, 0],  # ✅ 亚像素 X
+         y0=subpixel_coords[:, 1],  # ✅ 亚像素 Y  
          heights=heights_mm,
-         peaks=peaks,      # 原始峰值位置（用于验证）
+         peaks=peaks,
          N=N)
 
-# 10. 报告结果
+# 8. 报告结果
 miss = np.isnan(peaks).sum(axis=1)
 bad_spots = np.sum(miss > 0)
 print("\n" + "="*50)
