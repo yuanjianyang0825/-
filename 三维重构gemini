@@ -1,0 +1,76 @@
+import numpy as np
+import imageio.v2 as imageio
+from skimage.feature import peak_local_max
+from scipy.spatial import cKDTree
+
+# 1. 加载标定数据
+data = np.load('calib_data.npz', allow_pickle=True)
+calib_coeffs = data['coeffs']  # 多项式系数
+calib_ids = data['ids']        # 标定点的参考坐标 [N, 2] (Y, X)
+                               # 注意：这里的 ids 最好存的是 Z=中间值 时的坐标，或者 Z=0 时的坐标
+H_img, W_img = data['img_shape']
+
+# 2. 读取实物测量图
+measure_img = imageio.imread('measure_sample.bmp')
+if measure_img.ndim == 3: measure_img = measure_img[:,:,0]
+
+# 3. 提取实测光斑
+# 注意：这里只提取质心，先不用高斯，为了速度快。
+# 如果需要高精度，可以在匹配后再对这几个点做高斯优化。
+print("提取测量图光斑...")
+measure_coords = peak_local_max(measure_img, min_distance=15, threshold_abs=30) 
+# measure_coords is [y, x]
+
+# 4. 核心匹配逻辑：KDTree 寻找最近的“X轴”邻居
+# 我们构建一个特殊的距离度量：主要看 X 轴差异，次要看 Y 轴差异
+# 或者是：只看 X 轴差异，但前提是 Y 轴移动范围不能导致混淆
+
+# 为了匹配，我们使用标定时的 X 坐标作为指纹
+calib_X = calib_ids[:, 1] # 取出所有标定点的 X
+calib_Y_ref = calib_ids[:, 0] # 取出参考 Y
+
+measured_X = measure_coords[:, 1]
+measured_Y = measure_coords[:, 0]
+
+# 暴力匹配或 KDTree 匹配
+# 由于光斑数量 14000，建议用 KDTree
+# 技巧：我们将 Y 坐标的权重降低，因为 Y 是会变的，X 是不变的
+# 我们构造一个虚拟坐标系，把 X 放大权重，把 Y 缩小权重
+weight_x = 1.0
+weight_y = 0.05 # 允许 Y 有较大移动，但在距离计算中占比小
+
+# 构造加权坐标用于搜索
+tree_data = np.stack([calib_X * weight_x, calib_Y_ref * weight_y], axis=1)
+query_data = np.stack([measured_X * weight_x, measured_Y * weight_y], axis=1)
+
+tree = cKDTree(tree_data)
+# k=1 找最近的一个标定点
+# distance_upper_bound 设定一个容忍度，防止匹配到十万八千里外的点
+dists, indices = tree.query(query_data, k=1, distance_upper_bound=5.0)
+
+# 5. 计算高度
+results_cloud = [] # 存储结果 [x_real, y_real, z_height]
+
+print("正在计算高度...")
+for i, idx in enumerate(indices):
+    if idx == len(calib_ids): # 没匹配到（距离太远）
+        continue
+    
+    # idx 是标定数据的索引
+    coeffs = calib_coeffs[idx] 
+    
+    # 获取当前测量的 Y 值 (这里建议做一次 ROI 高斯拟合优化精度，此处略)
+    y_meas = measured_Y[i]
+    
+    # 代入多项式算出高度 Z
+    # 假设拟合的是 Z = f(pixel_y)
+    p = np.poly1d(coeffs)
+    z_val = p(y_meas)
+    
+    # 记录该点的物理坐标
+    # 注意：这里的 x, y 是面阵的物理位置，还是像素位置？
+    # 通常我们用像素位置 (measured_X[i], measured_Y[i]) 代表平面位置
+    results_cloud.append([measured_X[i], measured_Y[i], z_val])
+
+results_cloud = np.array(results_cloud)
+print(f"测量完成，获得 {len(results_cloud)} 个点的 3D 数据")
