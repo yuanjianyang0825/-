@@ -1,0 +1,186 @@
+"""
+- 量程：0–2.5 mm，26 张等间隔高度图像
+- 改进点：双轴动态追踪，去除硬编码位移预测
+"""
+
+import os, glob
+import numpy as np
+import imageio.v2 as imageio
+from skimage.feature import peak_local_max
+from scipy.optimize import curve_fit
+from numpy.polynomial import Polynomial
+
+# ==================== 配置区 ====================
+# 路径配置（请按实际修改）
+calib_dir = r"C:\Users\A\Desktop\biaoding"   
+
+# 标定参数
+# 注意：你是从 2.5mm 降到 0mm 还是 0mm 升到 2.5mm？
+# 你的文件名如果是 1.bmp, 2.bmp... 通常 1 代表起始位置。
+# 假设 1.bmp 对应 2.5mm (根据你之前的代码)，如果反了请修改这里。
+heights_mm = np.linspace(2.5, 0, 26)  
+
+roi_radius = 12                       # 稍微加大一点半径，防止跑丢
+gauss_fallback = True                 # 高斯拟合失败时回退到重心法
+
+# =================================================
+
+# ---------- 读图转灰度 ----------
+def to_gray(img):
+    if img.ndim == 2: return img.astype(np.float32)
+    return img[:, :, 0].astype(np.float32)
+
+# ---------- 高斯拟合函数 ----------
+def gauss_1d(x, A, mu, sigma, B):
+    return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2) + B
+
+def fit_gauss_center(line):
+    x = np.arange(len(line), dtype=float)
+    # 简单的重心法作为初值，提高拟合成功率
+    total = np.sum(line)
+    if total == 0: return np.nan
+    mu0 = np.sum(x * line) / total
+    
+    A0 = line.max() - line.min()
+    B0 = line.min()
+    sigma0 = 2.0
+    
+    try:
+        p0 = [A0, mu0, sigma0, B0]
+        # bounds 限制 mu 在 ROI 范围内，防止拟合飞出
+        popt, _ = curve_fit(gauss_1d, x, line, p0=p0, bounds=([0, 0, 0.1, -np.inf], [np.inf, len(line), len(line), np.inf]), maxfev=1000)
+        return popt[1]
+    except (RuntimeError, ValueError):
+        if gauss_fallback:
+            return mu0 # 回退到重心
+        else:
+            return np.nan
+
+# ==================== 主流程 ====================
+
+# 1. 读取标定图像
+print("正在加载标定图像...")
+if not os.path.exists(calib_dir):
+    raise FileNotFoundError(f"找不到文件夹: {calib_dir}")
+
+os.chdir(calib_dir)
+# 按文件名数字排序
+calib_files = sorted(glob.glob('*.bmp'), key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+
+if len(calib_files) != 26:
+    print(f"警告: 找到了 {len(calib_files)} 张图，但高度定义了 {len(heights_mm)} 个点。请检查！")
+
+imgs = np.stack([to_gray(imageio.imread(f)) for f in calib_files])
+H, W = imgs.shape[1], imgs.shape[2]
+print(f"✅ 标定图像已加载，形状: {imgs.shape}")
+
+# 2. 提取参考帧亮点
+# 建议：如果第0帧光斑不全，可以改用第13帧(中间)做参考，然后向两头追踪
+ref_idx = 0 
+ref_img = imgs[ref_idx]
+
+print("正在检测光斑...")
+# min_distance 决定了光斑的密集程度，根据你的面阵密度调整
+coords = peak_local_max(ref_img, min_distance=15, threshold_abs=30) 
+N = coords.shape[0]
+print(f"🔍 检测到 {N} 个有效光斑")
+
+# 3. 初始化轨迹数组
+# tracks[k, i, 0] = y, tracks[k, i, 1] = x
+tracks = np.full((N, len(calib_files), 2), np.nan, dtype=np.float32)
+
+# 4. 初始化第0帧（亚像素优化）
+print(f"正在优化第 {ref_idx} 帧坐标...")
+for k in range(N):
+    y0_int, x0_int = coords[k]
+    
+    # ROI 截取
+    y1 = max(int(y0_int) - roi_radius, 0)
+    y2 = min(int(y0_int) + roi_radius + 1, H)
+    x1 = max(int(x0_int) - roi_radius, 0)
+    x2 = min(int(x0_int) + roi_radius + 1, W)
+    
+    roi = ref_img[y1:y2, x1:x2]
+    
+    if roi.size > 0:
+        dy = fit_gauss_center(roi.sum(axis=1)) # 投影到Y轴算Y中心
+        dx = fit_gauss_center(roi.sum(axis=0)) # 投影到X轴算X中心
+        
+        if not np.isnan(dy) and not np.isnan(dx):
+            tracks[k, ref_idx, 0] = y1 + dy # Abs Y
+            tracks[k, ref_idx, 1] = x1 + dx # Abs X
+
+# 5. 动态追踪 (0 -> 25)
+# 如果参考帧不是0，这里需要写两段循环：一段向前，一段向后。
+# 这里假设参考帧是0，直接向后追踪
+print("正在进行双轴动态追踪...")
+
+for i in range(1, len(calib_files)):
+    success_count = 0
+    for k in range(N):
+        # 获取上一帧的坐标
+        last_y = tracks[k, i-1, 0]
+        last_x = tracks[k, i-1, 1]
+        
+        if np.isnan(last_y) or np.isnan(last_x):
+            continue # 上一帧就丢了，这一帧放弃
+            
+        # 以“上一帧”的坐标作为“当前帧”的ROI中心 (不做盲目预测，只做最近邻跟随)
+        # 因为步长只有0.1mm，光斑移动通常<5像素，肯定在ROI(半径12)内
+        cy, cx = int(last_y), int(last_x)
+        
+        y1 = max(cy - roi_radius, 0)
+        y2 = min(cy + roi_radius + 1, H)
+        x1 = max(cx - roi_radius, 0)
+        x2 = min(cx + roi_radius + 1, W)
+        
+        roi = imgs[i, y1:y2, x1:x2]
+        
+        if roi.size > 0 and roi.max() > 10: # 确保ROI里有亮斑
+            dy = fit_gauss_center(roi.sum(axis=1))
+            dx = fit_gauss_center(roi.sum(axis=0))
+            
+            if not np.isnan(dy) and not np.isnan(dx):
+                tracks[k, i, 0] = y1 + dy # 更新 Y
+                tracks[k, i, 1] = x1 + dx # 更新 X (这一点非常重要！)
+                success_count += 1
+    
+    # 简单的进度条
+    if i % 5 == 0:
+        print(f"  Frame {i}/{len(calib_files)-1}: 追踪到 {success_count}/{N} 个点")
+
+# 6. 多项式拟合与保存
+print("正在拟合与保存...")
+final_coeffs = []
+final_ids = []
+
+for k in range(N):
+    # 提取 Y 坐标 (通常光谱共焦只关心 Y 的移动)
+    y_series = tracks[k, :, 0]
+    valid_mask = ~np.isnan(y_series)
+    
+    if np.sum(valid_mask) > 15: # 至少有15个有效点才拟合
+        h_valid = heights_mm[valid_mask]
+        y_valid = y_series[valid_mask]
+        
+        # 拟合 Height = f(Pixel_Y) 还是 Pixel_Y = f(Height)?
+        # 测量时，我们是已知 Pixel_Y 求 Height。
+        # 所以直接拟合 Height = f(Pixel_Y) 比较方便后续使用。
+        try:
+            # 3次多项式拟合: H = a*y^3 + b*y^2 + c*y + d
+            c = np.polyfit(y_valid, h_valid, 3)
+            
+            # 保存数据: [Coeffs, (Original X, Original Y)]
+            # 记录第0帧的坐标作为该点的 ID
+            final_coeffs.append(c)
+            final_ids.append(tracks[k, 0, :]) 
+        except:
+            pass
+
+np.savez('calib_data.npz', 
+         coeffs=np.array(final_coeffs), 
+         ids=np.array(final_ids),
+         img_shape=(H, W))
+
+print(f"\n✅ 完成！成功标定 {len(final_coeffs)} / {N} 个光斑。")
+print("文件已保存为 calib_data.npz")
