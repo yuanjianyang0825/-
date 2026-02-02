@@ -1,0 +1,139 @@
+import os
+import glob
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, Button
+from skimage.feature import peak_local_max
+from scipy.ndimage import rotate
+import imageio.v2 as imageio
+
+# ================= 配置区 =================
+# 你的图片文件夹路径
+calib_dir = r"C:\Users\A\Desktop\biaoding" 
+
+# 为了速度，我们可以不用读完所有图，比如每隔几张读一张
+# step = 1 (读所有), step = 5 (每5张读一张)
+read_step = 1 
+
+# 检测光斑的阈值 (根据你的图片亮度调整)
+spot_thresh = 30
+min_dist = 15
+# ==========================================
+
+class TrajectoryVisualizer:
+    def __init__(self, img_folder, step=1):
+        self.img_paths = sorted(glob.glob(os.path.join(img_folder, "*.bmp")), 
+                               key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))[::step]
+        
+        if not self.img_paths:
+            raise FileNotFoundError("未找到图片，请检查路径")
+            
+        print(f"正在预处理 {len(self.img_paths)} 张图片...")
+        
+        # 1. 读取第一张图作为背景
+        self.img0 = imageio.imread(self.img_paths[0])
+        if self.img0.ndim == 3: self.img0 = self.img0[:,:,0]
+        self.h, self.w = self.img0.shape
+        self.center = (self.w / 2, self.h / 2)
+        
+        # 2. 提取每一张图的光斑坐标
+        self.all_centroids = [] # 列表，每个元素是 N x 2 的坐标数组
+        
+        for i, p in enumerate(self.img_paths):
+            print(f"  提取光斑: {i+1}/{len(self.img_paths)}", end='\r')
+            img = imageio.imread(p)
+            if img.ndim == 3: img = img[:,:,0]
+            
+            # 快速提取质心 (整像素即可，这里主要是看轨迹趋势)
+            coords = peak_local_max(img, min_distance=min_dist, threshold_abs=spot_thresh)
+            # coords is [y, x]
+            # 我们翻转为 [x, y] 方便绘图和计算
+            self.all_centroids.append(coords[:, [1, 0]])
+            
+        print("\n预处理完成，启动可视化窗口...")
+        self.setup_plot()
+
+    def rotate_points(self, points, angle_deg):
+        """
+        数学旋转坐标点 (绕图像中心)
+        x' = (x-cx)cos - (y-cy)sin + cx
+        y' = (x-cx)sin + (y-cy)cos + cy
+        """
+        angle_rad = np.radians(angle_deg)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+        
+        pts = points - np.array(self.center) # 移到中心
+        
+        x_new = pts[:, 0] * cos_a - pts[:, 1] * sin_a
+        y_new = pts[:, 0] * sin_a + pts[:, 1] * cos_a
+        
+        return np.stack([x_new, y_new], axis=1) + np.array(self.center)
+
+    def setup_plot(self):
+        # 创建画布
+        fig, self.ax = plt.subplots(figsize=(10, 8))
+        plt.subplots_adjust(bottom=0.2) # 留出底部给滑条
+        
+        # 初始显示
+        self.angle = 0.0
+        
+        # 显示背景图 (第一帧)
+        self.im_plot = self.ax.imshow(self.img0, cmap='gray', origin='upper')
+        
+        # 绘制轨迹点 - 修改为红到绿渐变
+        self.scatters = []
+        n_frames = len(self.all_centroids)
+        
+        # 创建红->绿渐变：红色(1,0,0) -> 黄色(1,1,0) -> 绿色(0,1,0)
+        # 使用线性插值生成RGB颜色
+        reds = np.linspace(1.0, 0.0, n_frames)    # 红色分量：1→0
+        greens = np.linspace(0.0, 1.0, n_frames)  # 绿色分量：0→1
+        blues = np.zeros(n_frames)                # 蓝色分量：始终为0
+        
+        # 组合成RGB颜色数组
+        colors = np.column_stack([reds, greens, blues])
+        
+        for i, pts in enumerate(self.all_centroids):
+            # 使用红-绿渐变色，点大小稍增大提高可见性
+            sc = self.ax.scatter(pts[:, 0], pts[:, 1], c=[colors[i]], s=3, alpha=0.7)
+            self.scatters.append(sc)
+            
+        self.ax.set_title(f"光斑轨迹视图 (角度: {self.angle:.2f}°)")
+        self.ax.grid(True, linestyle='--', alpha=0.3) # 网格很重要，用来对齐竖线
+        
+        # 添加滑条
+        ax_slider = plt.axes([0.2, 0.05, 0.6, 0.03])
+        self.slider = Slider(ax_slider, '旋转角度', -10.0, 10.0, valinit=0.0, valstep=0.1)
+        self.slider.on_changed(self.update)
+        
+        # 添加复位按钮
+        ax_button = plt.axes([0.85, 0.05, 0.1, 0.04])
+        self.btn = Button(ax_button, '复位')
+        self.btn.on_clicked(self.reset)
+
+        print("\n使用说明:")
+        print("1. 拖动滑条旋转视角。")
+        print("2. 使用鼠标滚轮缩放，右键拖动平移。")
+        print("3. 观察不同颜色的点是否连成一条【垂直竖线】。")
+        print("4. 红色是第0帧，绿色是最后一帧，中间为黄/橙色过渡。")
+        
+        plt.show()
+
+    def update(self, val):
+        angle = self.slider.val
+        
+        # 旋转所有散点
+        for i, pts in enumerate(self.all_centroids):
+            rot_pts = self.rotate_points(pts, angle)
+            self.scatters[i].set_offsets(rot_pts)
+            
+        self.ax.set_title(f"光斑轨迹视图 (角度: {angle:.2f}°)\n调整角度直到点的轨迹垂直于X轴")
+        self.ax.figure.canvas.draw_idle()
+
+    def reset(self, event):
+        self.slider.reset()
+
+if __name__ == "__main__":
+    # 启动
+    viz = TrajectoryVisualizer(calib_dir, read_step)
