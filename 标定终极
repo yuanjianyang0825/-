@@ -1,0 +1,197 @@
+"""
+光谱共焦标定 - 安全旋转版本（保留所有光斑）
+"""
+
+import os, glob
+import numpy as np
+import imageio.v2 as imageio
+from skimage.feature import peak_local_max
+from skimage.transform import rotate
+from scipy.ndimage import center_of_mass
+from scipy.optimize import curve_fit
+from numpy.polynomial import Polynomial
+
+# ==================== 配置区 ====================
+calib_dir = r"C:\Users\A\Desktop\biaoding"
+heights_mm = np.linspace(2.4, 0, 25)
+roi_radius = 9
+gauss_fallback = True
+rotation_angle = -3.6  # 顺时针3.6度
+# =================================================
+
+def compute_rotated_size(h, w, angle_deg):
+    theta = np.deg2rad(abs(angle_deg))
+    new_w = int(np.ceil(w * np.abs(np.cos(theta)) + h * np.abs(np.sin(theta))))
+    new_h = int(np.ceil(w * np.abs(np.sin(theta)) + h * np.abs(np.cos(theta))))
+    return new_h, new_w
+
+def rotate_image_safe(gray_img, angle_deg, out_shape):
+    rot = rotate(
+        gray_img,
+        angle=angle_deg,
+        resize=True,
+        mode='constant',
+        cval=0,
+        preserve_range=True,
+        order=1
+    ).astype(np.float32)
+    
+    # 尺寸校准（应对极小的浮点舍入差异）
+    if rot.shape != out_shape:
+        pad_h = out_shape[0] - rot.shape[0]
+        pad_w = out_shape[1] - rot.shape[1]
+        rot = np.pad(
+            rot,
+            ((max(0, pad_h//2), max(0, pad_h-pad_h//2)), 
+             (max(0, pad_w//2), max(0, pad_w-pad_w//2))),
+            mode='constant',
+            constant_values=0
+        )[:out_shape[0], :out_shape[1]]  # 截断超大情况
+    return rot
+
+def gauss_1d(x, A, mu, sigma, B):
+    return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2) + B
+
+def fit_gauss_center(line):
+    x = np.arange(len(line), dtype=float)
+    try:
+        mu0 = np.sum(x * line) / np.sum(line)
+        A0 = line.max() - line.min()
+        B0 = line.min()
+        p0 = [A0, mu0, 2.0, B0]
+        popt, _ = curve_fit(gauss_1d, x, line, p0=p0, maxfev=1000)
+        return popt[1]
+    except (RuntimeError, ValueError):
+        if gauss_fallback:
+            return center_of_mass(line)[0]
+        else:
+            return np.nan
+
+def fit_order(z, y, max_order=3, thresh=0.05):
+    valid = ~np.isnan(y)
+    if not np.any(valid):
+        return 1
+    z, y = z[valid], y[valid]
+    if len(z) < 2:
+        return 1
+    
+    best_deg = 1
+    prev_res = np.std(y - Polynomial.fit(z, y, 1)(z))
+    
+    for deg in range(2, min(max_order + 1, len(z))):
+        p = Polynomial.fit(z, y, deg)
+        res = np.std(y - p(z))
+        if prev_res - res < thresh:
+            break
+        prev_res = res
+        best_deg = deg
+    return best_deg
+
+# ==================== 主流程 ====================
+
+print("🔄 正在加载标定图像并计算统一旋转尺寸...")
+os.chdir(calib_dir)
+calib_files = sorted(glob.glob('*.bmp'), key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+
+# 第一步：读取第一张图确定目标尺寸
+first_img = imageio.imread(calib_files[0])
+gray_first = first_img[:, :, 0].astype(np.float32)
+H_orig, W_orig = gray_first.shape
+H_new, W_new = compute_rotated_size(H_orig, W_orig, abs(rotation_angle))
+target_shape = (H_new, W_new)
+
+print(f"   原始尺寸: {H_orig} × {W_orig}")
+print(f"   旋转后统一尺寸: {H_new} × {W_new} (+{(H_new-H_orig)/H_orig*100:.1f}% 高, +{(W_new-W_orig)/W_orig*100:.1f}% 宽)")
+
+# 第二步：批量旋转所有图像到统一尺寸
+imgs = []
+for i, f in enumerate(calib_files):
+    img = imageio.imread(f)
+    gray = img[:, :, 0].astype(np.float32)
+    rot = rotate_image_safe(gray, rotation_angle, target_shape)
+    imgs.append(rot)
+    if (i+1) % 5 == 0:
+        print(f"   已处理 {i+1}/25 张图像...")
+
+imgs = np.stack(imgs)
+print(f"✅ 所有25张图像已旋转至统一尺寸: {imgs.shape}")
+
+# 后续标定流程（与原代码一致，仅尺寸变为 H_new × W_new）
+ref_img = imgs[0]
+coords = peak_local_max(ref_img, min_distance=20, threshold_abs=50)
+N = coords.shape[0]
+print(f"🔍 在旋转后完整图像中检测到 {N} 个有效光斑")
+
+peaks = np.full((N, 25), np.nan, dtype=np.float32)
+subpixel_coords = np.full((N, 2), np.nan, dtype=np.float32)
+
+# 参考帧处理...
+for k in range(N):
+    y0, x0 = coords[k]
+    y1 = max(int(y0) - roi_radius, 0)
+    y2 = min(int(y0) + roi_radius + 1, H_new)
+    x1 = max(int(x0) - roi_radius, 0)
+    x2 = min(int(x0) + roi_radius + 1, W_new)
+    roi = imgs[0, y1:y2, x1:x2]
+    
+    if roi.size > 0 and roi.sum() > 1e-3:
+        dx = fit_gauss_center(roi.sum(axis=0))
+        dy = fit_gauss_center(roi.sum(axis=1))
+        subpixel_coords[k] = [x1 + dx, y1 + dy]
+        peaks[k, 0] = y1 + dy
+
+# 向后追踪...
+print("正在向后追踪 (1→24)...")
+for i in range(1, 25):
+    for k in range(N):
+        if np.isnan(peaks[k, i-1]) or np.isnan(subpixel_coords[k, 0]):
+            continue
+            
+        y_last = peaks[k, i-1] - 3
+        x_last = subpixel_coords[k, 0]
+        
+        y1 = max(int(y_last) - roi_radius, 0)
+        y2 = min(int(y_last) + roi_radius + 1, H_new)
+        x1 = max(int(x_last) - roi_radius, 0)
+        x2 = min(int(x_last) + roi_radius + 1, W_new)
+        
+        roi = imgs[i, y1:y2, x1:x2]
+        if roi.size > 0 and roi.sum() > 1e-3:
+            dy = fit_gauss_center(roi.sum(axis=1))
+            peaks[k, i] = y1 + dy
+
+# 多项式拟合...
+print("正在拟合标定曲线...")
+coeffs = []
+orders = np.empty(N, dtype=int)
+for k in range(N):
+    deg = fit_order(heights_mm, peaks[k])
+    p = Polynomial.fit(heights_mm, peaks[k], deg)
+    coeffs.append(p.convert().coef[::-1])
+    orders[k] = deg
+
+# 保存结果...
+np.savez('calib_table_full_retention.npz',
+         coeffs=np.array(coeffs, dtype=object),
+         orders=orders,
+         x0=subpixel_coords[:, 0],
+         y0=subpixel_coords[:, 1],
+         heights=heights_mm,
+         peaks=peaks,
+         N=N,
+         rotation_angle=rotation_angle,
+         original_shape=(H_orig, W_orig),
+         rotated_shape=(H_new, W_new),
+         resize_method='expand_to_fit_all_pixels')  # 明确标注保留策略
+
+# 报告
+miss = np.isnan(peaks).sum(axis=1)
+bad_spots = np.sum(miss > 0)
+print("\n" + "="*60)
+print("✅ 标定完成！（所有光斑完整保留）")
+print(f"• 旋转角度: {abs(rotation_angle)}° 顺时针")
+print(f"• 原始尺寸 → 旋转后尺寸: {H_orig}×{W_orig} → {H_new}×{W_new}")
+print(f"• 总光斑数: {N}")
+print(f"• 存在丢失帧的光斑数: {bad_spots} ({bad_spots/N*100:.1f}%)")
+print(f"• 标定文件: calib_table_full_retention.npz")
+print("="*60)
