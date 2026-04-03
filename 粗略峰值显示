@@ -1,0 +1,80 @@
+"""
+光斑检测 - 粗略峰值显示版本
+直接使用 peak_local_max 检测的整数像素坐标
+"""
+
+import os
+import numpy as np
+import imageio.v2 as imageio
+import matplotlib.pyplot as plt
+from skimage.feature import peak_local_max
+
+# ==================== 配置 ====================
+calib_dir = r"C:\Users\A\Desktop\biaoding"
+image_index = 0         # 0=第一张图像
+min_distance = 25        # 调整此值控制检测密度
+threshold_abs = 60       # 调整此值过滤弱响应
+hover_radius = 15        # 鼠标悬停感应半径（像素）
+# ==============================================
+
+# 读取图像
+os.chdir(calib_dir)
+files = sorted([f for f in os.listdir() if f.endswith('.bmp')],
+               key=lambda p: int(os.path.splitext(p)[0]))
+img = imageio.imread(files[image_index])
+gray = img[:, :, 0].astype(np.float32)
+
+# 1. 粗略极值检测（直接使用结果，不做质心优化）
+coords = peak_local_max(gray, min_distance=min_distance, threshold_abs=threshold_abs)
+print(f"🔍 检测到 {len(coords)} 个粗略极值点（整像素精度）")
+
+# 2. 坐标格式转换：peak_local_max 返回 [y, x]，绘图需要 [x, y]
+peaks = coords[:, [1, 0]]  # 翻转为 (x, y) 格式
+
+# 3. 交互式可视化
+fig, ax = plt.subplots(figsize=(16, 4))
+ax.imshow(gray, cmap='gray', origin='upper')
+scatter = ax.scatter(peaks[:, 0], peaks[:, 1], 
+                     c='red', s=20, marker='o', alpha=0.8, edgecolors='white', linewidths=0.5)
+
+# 创建注释框（初始隐藏）
+annot = ax.annotate("", xy=(0, 0), xytext=(10, 10),
+                    textcoords="offset points",
+                    bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.8),
+                    arrowprops=dict(arrowstyle="->", color='red', lw=1),
+                    fontsize=10, weight='bold')
+annot.set_visible(False)
+
+# 悬停事件处理
+def hover(event):
+    if event.inaxes != ax:
+        annot.set_visible(False)
+        fig.canvas.draw_idle()
+        return
+    
+    # 检查鼠标是否靠近某个峰值点
+    for i, (x, y) in enumerate(peaks):
+        if np.hypot(x - event.xdata, y - event.ydata) < hover_radius:
+            annot.xy = (x, y)
+            annot.set_text(f"Spot #{i}\nX={x:.0f} px\nY={y:.0f} px")  # 🔹 整数显示
+            annot.set_visible(True)
+            fig.canvas.draw_idle()
+            return
+    
+    # 未靠近任何点则隐藏
+    if annot.get_visible():
+        annot.set_visible(False)
+        fig.canvas.draw_idle()
+
+# 绑定事件
+fig.canvas.mpl_connect("motion_notify_event", hover)
+
+# 标题与布局
+ax.set_title(f'{files[image_index]} | {len(peaks)} peaks (peak_local_max, integer pixels)', 
+             fontsize=12, pad=10)
+ax.axis('off')
+plt.tight_layout()
+print("\n🖱️  将鼠标悬停在红点上查看像素坐标（X, Y）")
+print("   ⚠️  注意：这是整像素坐标（非亚像素）")
+print("   按 Ctrl+W 或关闭窗口退出")
+plt.show()
