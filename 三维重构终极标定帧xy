@@ -1,6 +1,7 @@
 """
-光谱共焦三维重构系统 - 标定帧理论坐标版
+光谱共焦三维重构系统 - 标定帧理论坐标版（适配2.7mm量程）
 - 点云X/Y: 使用标定帧理论位置（针孔阵列均匀分布）
+- 高度量程自动适配标定范围（0~2.7mm）
 - 其他逻辑完全保持不变（包括Y轴翻转）
 """
 
@@ -20,9 +21,8 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ==================== 配置区 ====================
-calib_file = r"C:\Users\A\Desktop\biaoding\calib_table_full_retention.npz"
-sample_img_path = r"C:\Users\A\Desktop\biaoding\2.bmp"
-
+calib_file = r"C:\Users\A\Desktop\biaoding4.1\calib_table_full_retention.npz"
+sample_img_path = r"C:\Users\A\Desktop\Image-Captured-At04-01-13-05-49\1.bmp"
 # 光斑匹配参数
 x_tolerance = 2
 y_min_offset = -85.0
@@ -87,7 +87,7 @@ def rotate_image_safe(gray_img, angle_deg, out_shape):
 # ==================== 主流程 ====================
 
 print("="*70)
-print("🔬 光谱共焦三维重构系统 - 标定帧理论坐标版")
+print("🔬 光谱共焦三维重构系统 - 标定帧理论坐标版（适配2.7mm量程）")
 print("="*70)
 
 # 1. 加载标定数据
@@ -100,7 +100,7 @@ x0_calib = calib_data['x0']
 y0_calib = calib_data['y0']
 coeffs = calib_data['coeffs']
 orders = calib_data['orders']
-heights_mm = calib_data['heights']
+heights_mm = calib_data['heights']  # ✅ 自动读取标定高度范围 (0~2.7mm)
 peaks = calib_data['peaks']
 N = int(calib_data['N'])
 rotation_angle = float(calib_data['rotation_angle'])
@@ -109,6 +109,7 @@ rotated_shape = tuple(calib_data['rotated_shape'])
 print(f"   • 标定光斑总数: {N}")
 print(f"   • 旋转角度: {abs(rotation_angle)}° 顺时针")
 print(f"   • 旋转后尺寸: {rotated_shape[0]}×{rotated_shape[1]}")
+print(f"   • 标定高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm")  # ✅ 显示实际量程
 
 # 2. 加载并旋转样品图像
 print("\n[2/6] 正在加载并旋转样品图像...")
@@ -189,9 +190,14 @@ match_rate = num_matched / N * 100
 print(f"   • 成功匹配光斑: {num_matched} / {N} ({match_rate:.1f}%)")
 print(f"   • 未匹配光斑: {N - num_matched}")
 
-# 5. 高度反解
+# 5. 高度反解（✅ 关键修改：使用标定范围替代硬编码2.5）
 print("\n[5/6] 正在反解表面高度...")
 z_heights = np.full(len(matches), np.nan, dtype=np.float32)
+
+# ✅ 获取标定实际量程（自动适配2.7mm）
+z_min_valid = heights_mm.min()  # 0.0 mm
+z_max_valid = heights_mm.max()  # 2.7 mm
+num_discarded = 0  # 统计舍弃数量
 
 for i, match_idx in enumerate(matches):
     if match_idx < 0:
@@ -210,10 +216,17 @@ for i, match_idx in enumerate(matches):
     best_z_idx = np.argmin(residuals)
     z_est = z_search[best_z_idx]
     
-    if 0 <= z_est <= 2.5:
+    # ✅ 修正：使用标定范围检查（0~2.7mm），不再硬编码2.5
+    if z_min_valid <= z_est <= z_max_valid:
         z_heights[i] = z_est
     else:
-        print(f"   ⚠️  光斑#{i} 反解高度 {z_est:.4f}mm 超出量程，已丢弃")
+        num_discarded += 1
+        # 仅当舍弃比例>5%时才显示警告（避免单个点干扰）
+        if num_discarded <= 5 or num_discarded % 10 == 0:
+            print(f"   ⚠️  光斑#{i} 反解高度 {z_est:.4f}mm 超出标定量程 [{z_min_valid:.1f}, {z_max_valid:.1f}]mm，已舍弃")
+
+if num_discarded > 0:
+    print(f"   • 共舍弃 {num_discarded} 个超量程点 ({num_discarded/len(matches)*100:.1f}%)")
 
 # 提取有效结果
 valid_z_mask = ~np.isnan(z_heights)
@@ -322,7 +335,7 @@ else:
     ax6.set_title('匹配质量分析', fontsize=11, fontweight='bold')
 
 plt.tight_layout()
-plt.suptitle('光谱共焦三维重构 - 标定帧理论坐标版', 
+plt.suptitle('光谱共焦三维重构 - 标定帧理论坐标版（适配2.7mm量程）', 
             fontsize=14, fontweight='bold', y=0.995)
 plt.show()
 
@@ -348,17 +361,19 @@ if save_results:
     report_path = os.path.join(output_dir, f"{base_name}_matching_report.txt")
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("="*60 + "\n")
-        f.write("光谱共焦三维重构 - 匹配质量报告\n")
+        f.write("光谱共焦三维重构 - 匹配质量报告（适配2.7mm量程）\n")
         f.write("="*60 + "\n")
         f.write(f"样品图像: {sample_img_path}\n")
         f.write(f"标定文件: {calib_file}\n")
         f.write(f"旋转角度: {abs(rotation_angle)}° 顺时针\n")
+        f.write(f"标定高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm\n")  # ✅ 明确标注量程
         f.write(f"坐标系: 旋转后坐标系（标定帧理论坐标）\n")
         f.write("-"*60 + "\n")
         f.write(f"标定光斑总数: {N}\n")
         f.write(f"样品检测光斑: {len(sample_subpixel_valid)}\n")
         f.write(f"成功匹配光斑: {num_matched} ({match_rate:.1f}%)\n")
         f.write(f"有效高度点: {len(z_valid)}\n")
+        f.write(f"超量程舍弃点: {num_discarded} ({num_discarded/len(matches)*100:.1f}%)\n")  # ✅ 报告舍弃统计
         f.write("-"*60 + "\n")
         if len(z_valid) > 0:
             f.write(f"高度范围: {z_valid.min():.4f} ~ {z_valid.max():.4f} mm\n")
@@ -369,10 +384,12 @@ if save_results:
 
 # 9. 最终报告
 print("\n" + "="*70)
-print("✅ 三维重构完成！")
+print("✅ 三维重构完成！（适配2.7mm量程）")
 print("="*70)
+print(f"• 标定高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm")
 print(f"• 匹配成功率: {num_matched}/{N} ({match_rate:.1f}%)")
 print(f"• 有效3D点数: {len(z_valid)}")
+print(f"• 超量程舍弃: {num_discarded} 点 ({num_discarded/len(matches)*100:.1f}%)")
 if len(z_valid) > 0:
     print(f"• 高度范围: {z_valid.min():.4f} ~ {z_valid.max():.4f} mm")
     print(f"• 表面粗糙度(RMS): {z_valid.std():.4f} mm")
