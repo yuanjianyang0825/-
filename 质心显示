@@ -1,0 +1,94 @@
+"""
+质心法求出质心并用红点在原图显示，对图片测试发现要去除暗噪声，要防止过曝
+"""
+
+
+import os
+import numpy as np
+import imageio.v2 as imageio
+import matplotlib.pyplot as plt
+from skimage.feature import peak_local_max
+from scipy.ndimage import center_of_mass
+
+# ==================== 配置 ====================
+calib_dir = r"C:\Users\A\Desktop\biaoding"
+image_index = 5          # 0=第一张图像
+min_distance = 25        # 调整此值控制检测密度
+threshold_abs = 60       # 调整此值过滤弱响应
+roi_radius = 10           # ROI半径（像素）
+hover_radius = 15        # 鼠标悬停感应半径（像素）
+# ==============================================
+
+# 读取图像
+os.chdir(calib_dir)
+files = sorted([f for f in os.listdir() if f.endswith('.bmp')],
+               key=lambda p: int(os.path.splitext(p)[0]))
+img = imageio.imread(files[image_index])
+gray = img[:, :, 0].astype(np.float32)
+
+# 1. 粗略极值检测
+coords = peak_local_max(gray, min_distance=min_distance, threshold_abs=threshold_abs)
+print(f"🔍 检测到 {len(coords)} 个粗略极值点")
+
+# 2. ROI质心计算
+centroids = []
+for y0, x0 in coords:
+    y1 = max(0, int(y0) - roi_radius)
+    y2 = min(gray.shape[0], int(y0) + roi_radius + 1)
+    x1 = max(0, int(x0) - roi_radius)
+    x2 = min(gray.shape[1], int(x0) + roi_radius + 1)
+    roi = gray[y1:y2, x1:x2]
+    
+    if roi.size > 0:
+        cy, cx = center_of_mass(roi)
+        centroids.append((x1 + cx, y1 + cy))
+
+centroids = np.array(centroids)
+print(f"✅ 计算得到 {len(centroids)} 个亚像素质心")
+
+# 3. 交互式可视化
+fig, ax = plt.subplots(figsize=(16, 4))
+ax.imshow(gray, cmap='gray', origin='upper')
+scatter = ax.scatter(centroids[:, 0], centroids[:, 1], 
+                     c='red', s=20, marker='o', alpha=0.8, edgecolors='white', linewidths=0.5)
+
+# 创建注释框（初始隐藏）
+annot = ax.annotate("", xy=(0, 0), xytext=(10, 10),
+                    textcoords="offset points",
+                    bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.8),
+                    arrowprops=dict(arrowstyle="->", color='red', lw=1),
+                    fontsize=10, weight='bold')
+annot.set_visible(False)
+
+# 悬停事件处理
+def hover(event):
+    if event.inaxes != ax:
+        annot.set_visible(False)
+        fig.canvas.draw_idle()
+        return
+    
+    # 检查鼠标是否靠近某个质心
+    for i, (x, y) in enumerate(centroids):
+        if np.hypot(x - event.xdata, y - event.ydata) < hover_radius:
+            annot.xy = (x, y)
+            annot.set_text(f"Spot #{i}\nX={x:.1f} px\nY={y:.1f} px")
+            annot.set_visible(True)
+            fig.canvas.draw_idle()
+            return
+    
+    # 未靠近任何点则隐藏
+    if annot.get_visible():
+        annot.set_visible(False)
+        fig.canvas.draw_idle()
+
+# 绑定事件
+fig.canvas.mpl_connect("motion_notify_event", hover)
+
+# 标题与布局
+ax.set_title(f'{files[image_index]} | {len(centroids)} centroids (hover to see coordinates)', 
+             fontsize=12, pad=10)
+ax.axis('off')
+plt.tight_layout()
+print("\n🖱️  将鼠标悬停在红点上查看像素坐标（X, Y）")
+print("   按 Ctrl+W 或关闭窗口退出")
+plt.show()
