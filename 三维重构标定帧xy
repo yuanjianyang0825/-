@@ -1,7 +1,7 @@
 """
-光谱共焦三维重构系统 - 标定帧理论坐标版（适配2.7mm量程）
+光谱共焦三维重构系统 - 标定帧理论坐标版（适配2.5mm量程）
 - 点云X/Y: 使用标定帧理论位置（针孔阵列均匀分布）
-- 高度量程自动适配标定范围（0~2.7mm）
+- 高度量程自动适配标定范围（0~2.5mm，26帧）
 - 其他逻辑完全保持不变（包括Y轴翻转）
 """
 
@@ -21,12 +21,13 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ==================== 配置区 ====================
-calib_file = r"C:\Users\A\Desktop\biaoding4.1\calib_table_full_retention.npz"
-sample_img_path = r"C:\Users\A\Desktop\Image-Captured-At04-01-13-05-49\1.bmp"
+# 🔹 修改1: 标定文件路径 → 使用26帧标定结果
+calib_file = r"C:\Users\A\Desktop\a标定用\calib_table_26frames.npz"
+sample_img_path = r"C:\Users\A\Desktop\juhua11w\12.bmp"
 # 光斑匹配参数
 x_tolerance = 2
 y_min_offset = -85.0
-y_max_offset = 0.0
+y_max_offset = 0
 
 # 重构参数
 roi_radius = 9
@@ -87,7 +88,8 @@ def rotate_image_safe(gray_img, angle_deg, out_shape):
 # ==================== 主流程 ====================
 
 print("="*70)
-print("🔬 光谱共焦三维重构系统 - 标定帧理论坐标版（适配2.7mm量程）")
+# 🔹 修改2: 标题更新为2.5mm量程
+print("🔬 光谱共焦三维重构系统 - 标定帧理论坐标版（适配2.5mm量程）")
 print("="*70)
 
 # 1. 加载标定数据
@@ -100,7 +102,7 @@ x0_calib = calib_data['x0']
 y0_calib = calib_data['y0']
 coeffs = calib_data['coeffs']
 orders = calib_data['orders']
-heights_mm = calib_data['heights']  # ✅ 自动读取标定高度范围 (0~2.7mm)
+heights_mm = calib_data['heights']  # ✅ 自动读取标定高度范围 (0~2.5mm)
 peaks = calib_data['peaks']
 N = int(calib_data['N'])
 rotation_angle = float(calib_data['rotation_angle'])
@@ -109,7 +111,8 @@ rotated_shape = tuple(calib_data['rotated_shape'])
 print(f"   • 标定光斑总数: {N}")
 print(f"   • 旋转角度: {abs(rotation_angle)}° 顺时针")
 print(f"   • 旋转后尺寸: {rotated_shape[0]}×{rotated_shape[1]}")
-print(f"   • 标定高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm")  # ✅ 显示实际量程
+# 🔹 修改3: 显示实际标定量程（自动适配26帧）
+print(f"   • 标定高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm (26帧)")
 
 # 2. 加载并旋转样品图像
 print("\n[2/6] 正在加载并旋转样品图像...")
@@ -131,7 +134,7 @@ print("\n[3/6] 正在检测样品光斑并亚像素定位...")
 sample_peaks = peak_local_max(
     rotated_sample,
     min_distance=20,
-    threshold_abs=50
+    threshold_abs=20
 )
 print(f"   • 粗检测光斑数: {len(sample_peaks)}")
 
@@ -190,13 +193,13 @@ match_rate = num_matched / N * 100
 print(f"   • 成功匹配光斑: {num_matched} / {N} ({match_rate:.1f}%)")
 print(f"   • 未匹配光斑: {N - num_matched}")
 
-# 5. 高度反解（✅ 关键修改：使用标定范围替代硬编码2.5）
+# 5. 高度反解（✅ 关键：使用标定范围自动适配，无需硬编码）
 print("\n[5/6] 正在反解表面高度...")
 z_heights = np.full(len(matches), np.nan, dtype=np.float32)
 
-# ✅ 获取标定实际量程（自动适配2.7mm）
+# ✅ 获取标定实际量程（自动适配26帧: 0~2.5mm）
 z_min_valid = heights_mm.min()  # 0.0 mm
-z_max_valid = heights_mm.max()  # 2.7 mm
+z_max_valid = heights_mm.max()  # 2.5 mm
 num_discarded = 0  # 统计舍弃数量
 
 for i, match_idx in enumerate(matches):
@@ -216,7 +219,7 @@ for i, match_idx in enumerate(matches):
     best_z_idx = np.argmin(residuals)
     z_est = z_search[best_z_idx]
     
-    # ✅ 修正：使用标定范围检查（0~2.7mm），不再硬编码2.5
+    # ✅ 修正：使用标定范围检查（0~2.5mm），自动适配26帧
     if z_min_valid <= z_est <= z_max_valid:
         z_heights[i] = z_est
     else:
@@ -232,7 +235,7 @@ if num_discarded > 0:
 valid_z_mask = ~np.isnan(z_heights)
 match_indices = matches[valid_z_mask]
 
-# ✅ 核心修改：使用标定帧理论坐标（仅此一处修改）
+# ✅ 核心：使用标定帧理论坐标（针孔阵列均匀分布）
 x_calib_matched = x0_calib[match_indices]  # 标定帧X（理论均匀）
 y_calib_matched = y0_calib[match_indices]  # 标定帧Y（理论均匀）
 z_valid = z_heights[valid_z_mask]
@@ -335,7 +338,8 @@ else:
     ax6.set_title('匹配质量分析', fontsize=11, fontweight='bold')
 
 plt.tight_layout()
-plt.suptitle('光谱共焦三维重构 - 标定帧理论坐标版（适配2.7mm量程）', 
+# 🔹 修改4: 主标题更新
+plt.suptitle('光谱共焦三维重构 - 标定帧理论坐标版（适配2.5mm量程）', 
             fontsize=14, fontweight='bold', y=0.995)
 plt.show()
 
@@ -361,19 +365,21 @@ if save_results:
     report_path = os.path.join(output_dir, f"{base_name}_matching_report.txt")
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("="*60 + "\n")
-        f.write("光谱共焦三维重构 - 匹配质量报告（适配2.7mm量程）\n")
+        # 🔹 修改5: 报告标题更新
+        f.write("光谱共焦三维重构 - 匹配质量报告（适配2.5mm量程）\n")
         f.write("="*60 + "\n")
         f.write(f"样品图像: {sample_img_path}\n")
         f.write(f"标定文件: {calib_file}\n")
         f.write(f"旋转角度: {abs(rotation_angle)}° 顺时针\n")
-        f.write(f"标定高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm\n")  # ✅ 明确标注量程
+        # 🔹 修改6: 明确标注26帧标定量程
+        f.write(f"标定高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm (26帧)\n")
         f.write(f"坐标系: 旋转后坐标系（标定帧理论坐标）\n")
         f.write("-"*60 + "\n")
         f.write(f"标定光斑总数: {N}\n")
         f.write(f"样品检测光斑: {len(sample_subpixel_valid)}\n")
         f.write(f"成功匹配光斑: {num_matched} ({match_rate:.1f}%)\n")
         f.write(f"有效高度点: {len(z_valid)}\n")
-        f.write(f"超量程舍弃点: {num_discarded} ({num_discarded/len(matches)*100:.1f}%)\n")  # ✅ 报告舍弃统计
+        f.write(f"超量程舍弃点: {num_discarded} ({num_discarded/len(matches)*100:.1f}%)\n")
         f.write("-"*60 + "\n")
         if len(z_valid) > 0:
             f.write(f"高度范围: {z_valid.min():.4f} ~ {z_valid.max():.4f} mm\n")
@@ -384,9 +390,10 @@ if save_results:
 
 # 9. 最终报告
 print("\n" + "="*70)
-print("✅ 三维重构完成！（适配2.7mm量程）")
+# 🔹 修改7: 最终报告标题更新
+print("✅ 三维重构完成！（适配2.5mm量程，26帧标定）")
 print("="*70)
-print(f"• 标定高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm")
+print(f"• 标定高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm (26帧)")
 print(f"• 匹配成功率: {num_matched}/{N} ({match_rate:.1f}%)")
 print(f"• 有效3D点数: {len(z_valid)}")
 print(f"• 超量程舍弃: {num_discarded} 点 ({num_discarded/len(matches)*100:.1f}%)")
