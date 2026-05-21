@@ -1,5 +1,5 @@
 """
-光谱共焦标定 - 安全旋转版本（27帧，保留所有光斑）
+光谱共焦标定 - 安全旋转版本（26帧，保留所有光斑）
 """
 
 import os, glob
@@ -12,11 +12,11 @@ from scipy.optimize import curve_fit
 from numpy.polynomial import Polynomial
 
 # ==================== 配置区 ====================
-calib_dir = r"C:\Users\A\Desktop\biaoding4.1"
-heights_mm = np.linspace(2.6, 0, 27)  # 🔹 27个高度点：2.6mm → 0mm
+calib_dir = r"C:\Users\A\Desktop\a标定用"
+heights_mm = np.linspace(2.5, 0, 26)  # 🔹 26个高度点：2.5mm → 0mm
 roi_radius = 8
 gauss_fallback = True
-rotation_angle = -3  # 顺时针3度
+rotation_angle = -3.6  # 顺时针3.1度
 # =================================================
 
 def compute_rotated_size(h, w, angle_deg):
@@ -93,11 +93,11 @@ print("🔄 正在加载标定图像并计算统一旋转尺寸...")
 os.chdir(calib_dir)
 calib_files = sorted(glob.glob('*.bmp'), key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
 
-# 🔹 验证图像数量：27张
-if len(calib_files) != 27:
-    print(f"⚠️  警告: 检测到 {len(calib_files)} 张图像，预期27张")
-    if len(calib_files) < 27:
-        raise ValueError(f"图像数量不足: {len(calib_files)}/27")
+# 🔹 验证图像数量：26张
+if len(calib_files) != 26:
+    print(f"⚠️  警告: 检测到 {len(calib_files)} 张图像，预期26张")
+    if len(calib_files) < 26:
+        raise ValueError(f"图像数量不足: {len(calib_files)}/26")
 
 # 第一步：读取第一张图确定目标尺寸
 first_img = imageio.imread(calib_files[0])
@@ -109,28 +109,28 @@ target_shape = (H_new, W_new)
 print(f"   原始尺寸: {H_orig} × {W_orig}")
 print(f"   旋转后统一尺寸: {H_new} × {W_new} (+{(H_new-H_orig)/H_orig*100:.1f}% 高, +{(W_new-W_orig)/W_orig*100:.1f}% 宽)")
 
-# 第二步：批量旋转所有27张图像到统一尺寸
+# 第二步：批量旋转所有26张图像到统一尺寸
 imgs = []
 for i, f in enumerate(calib_files):
     img = imageio.imread(f)
     gray = img[:, :, 0].astype(np.float32)
     rot = rotate_image_safe(gray, rotation_angle, target_shape)
     imgs.append(rot)
-    # 每5张或最后一张显示进度
+    # 每5张或最后一张显示进度（动态适配帧数）
     if (i+1) % 5 == 0 or i == len(calib_files) - 1:
-        print(f"   已处理 {i+1}/27 张图像...")
+        print(f"   已处理 {i+1}/{len(calib_files)} 张图像...")
 
 imgs = np.stack(imgs)
-print(f"✅ 所有27张图像已旋转至统一尺寸: {imgs.shape}")
+print(f"✅ 所有26张图像已旋转至统一尺寸: {imgs.shape}")
 
-# 后续标定流程（适配27帧）
+# 后续标定流程（适配26帧）
 ref_img = imgs[0]
 coords = peak_local_max(ref_img, min_distance=20, threshold_abs=50)
 N = coords.shape[0]
 print(f"🔍 在旋转后完整图像中检测到 {N} 个有效光斑")
 
-# 🔹 关键修改1: peaks数组维度改为27（对应27帧）
-peaks = np.full((N, 27), np.nan, dtype=np.float32)  # 27帧高度数据
+# 🔹 关键修改1: peaks数组维度改为26（对应26帧）
+peaks = np.full((N, 26), np.nan, dtype=np.float32)  # 26帧高度数据
 subpixel_coords = np.full((N, 2), np.nan, dtype=np.float32)
 
 # 参考帧处理（第0帧）
@@ -148,9 +148,9 @@ for k in range(N):
         subpixel_coords[k] = [x1 + dx, y1 + dy]
         peaks[k, 0] = y1 + dy
 
-# 🔹 关键修改2: 向后追踪范围改为 1→26（共26次迭代，对应27帧）
-print("正在向后追踪 (1→26)...")
-for i in range(1, 27):  # 🔹 从第1帧追踪到第26帧（0索引），共26次迭代
+# 🔹 关键修改2: 向后追踪范围改为 1→25（共25次迭代，对应26帧）
+print("正在向后追踪 (1→25)...")
+for i in range(1, 26):  # 🔹 从第1帧追踪到第25帧（0索引），共25次迭代
     for k in range(N):
         if np.isnan(peaks[k, i-1]) or np.isnan(subpixel_coords[k, 0]):
             continue
@@ -178,8 +178,8 @@ for k in range(N):
     coeffs.append(p.convert().coef[::-1])
     orders[k] = deg
 
-# 保存结果
-np.savez('calib_table_full_retention.npz',
+# 保存结果（文件名更新，避免覆盖27帧结果）
+np.savez('calib_table_26frames.npz',
          coeffs=np.array(coeffs, dtype=object),
          orders=orders,
          x0=subpixel_coords[:, 0],
@@ -192,15 +192,15 @@ np.savez('calib_table_full_retention.npz',
          rotated_shape=(H_new, W_new),
          resize_method='expand_to_fit_all_pixels')
 
-# 🔹 报告输出：统一改为27帧
+# 🔹 报告输出：统一改为26帧
 miss = np.isnan(peaks).sum(axis=1)
 bad_spots = np.sum(miss > 0)
 print("\n" + "="*60)
-print("✅ 标定完成！（27帧，所有光斑完整保留）")  # 🔹 27帧
+print("✅ 标定完成！（26帧，所有光斑完整保留）")  # 🔹 26帧
 print(f"• 旋转角度: {abs(rotation_angle)}° 顺时针")
 print(f"• 原始尺寸 → 旋转后尺寸: {H_orig}×{W_orig} → {H_new}×{W_new}")
-print(f"• 标定帧数: 27帧 (高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm)")  # 🔹 27帧
+print(f"• 标定帧数: 26帧 (高度范围: {heights_mm.min():.1f} ~ {heights_mm.max():.1f} mm)")  # 🔹 26帧
 print(f"• 总光斑数: {N}")
 print(f"• 存在丢失帧的光斑数: {bad_spots} ({bad_spots/N*100:.1f}%)")
-print(f"• 标定文件: calib_table_full_retention.npz")
+print(f"• 标定文件: calib_table_26frames.npz")
 print("="*60)
