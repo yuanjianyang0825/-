@@ -1,0 +1,593 @@
+"""
+build_calibration_database.py
+光谱共焦标定数据库生成
+"""
+
+import os
+import glob
+import numpy as np
+import imageio.v2 as imageio
+
+from scipy.optimize import curve_fit
+from scipy.ndimage import center_of_mass
+from skimage.feature import peak_local_max
+from numpy.polynomial import Polynomial
+
+# =====================================================
+# 参数
+# =====================================================
+
+calib_dir = r"C:\Users\A\Desktop\a标定用"
+
+heights_mm = np.linspace(2.5, 0, 26)
+
+roi_radius = 8
+
+threshold_abs = 35
+min_distance = 20
+
+BAD_PIXELS = [
+    (1207, 2750),
+    (373, 2688)
+]
+
+MAX_OFFLINE_DISTANCE = 0.5
+
+# =====================================================
+# 高斯拟合
+# =====================================================
+
+def gauss_1d(x, A, mu, sigma, B):
+    return A * np.exp(
+        -0.5 * ((x - mu) / sigma) ** 2
+    ) + B
+
+
+def fit_gauss_center(line):
+
+    x = np.arange(
+        len(line),
+        dtype=float
+    )
+
+    try:
+
+        mu0 = np.sum(
+            x * line
+        ) / np.sum(line)
+
+        p0 = [
+            line.max() - line.min(),
+            mu0,
+            2.0,
+            line.min()
+        ]
+
+        popt, _ = curve_fit(
+            gauss_1d,
+            x,
+            line,
+            p0=p0,
+            maxfev=1000
+        )
+
+        return popt[1]
+
+    except:
+
+        return center_of_mass(line)[0]
+
+
+# =====================================================
+# 自动选阶
+# =====================================================
+
+def fit_order(z, y,
+              max_order=3,
+              thresh=0.05):
+
+    valid = ~np.isnan(y)
+
+    z = z[valid]
+    y = y[valid]
+
+    if len(z) < 3:
+        return 1
+
+    best_deg = 1
+
+    prev_res = np.std(
+        y - Polynomial.fit(
+            z,
+            y,
+            1
+        )(z)
+    )
+
+    for deg in range(
+        2,
+        min(
+            max_order + 1,
+            len(z)
+        )
+    ):
+
+        p = Polynomial.fit(
+            z,
+            y,
+            deg
+        )
+
+        res = np.std(
+            y - p(z)
+        )
+
+        if prev_res - res < thresh:
+            break
+
+        prev_res = res
+        best_deg = deg
+
+    return best_deg
+
+
+# =====================================================
+# PCA拟合运动方向
+# =====================================================
+
+def fit_line_pca(x, y):
+
+    valid = ~(
+        np.isnan(x)
+        |
+        np.isnan(y)
+    )
+
+    if np.sum(valid) < 3:
+        return None
+
+    pts = np.column_stack(
+        (
+            x[valid],
+            y[valid]
+        )
+    )
+
+    center = pts.mean(
+        axis=0
+    )
+
+    pts_centered = (
+        pts - center
+    )
+
+    _, _, vt = np.linalg.svd(
+        pts_centered,
+        full_matrices=False
+    )
+
+    direction = vt[0]
+
+    vx, vy = direction
+
+    normal = np.array(
+        [-vy, vx]
+    )
+
+    distances = np.abs(
+        pts_centered @ normal
+    )
+
+    max_distance = np.max(
+        distances
+    )
+
+    return (
+        center,
+        direction,
+        max_distance
+    )
+
+
+# =====================================================
+# 读取图像
+# =====================================================
+
+print("\n==============================")
+print("读取标定图像")
+print("==============================")
+
+files = sorted(
+    glob.glob(
+        os.path.join(
+            calib_dir,
+            "*.bmp"
+        )
+    ),
+    key=lambda p: int(
+        os.path.splitext(
+            os.path.basename(p)
+        )[0]
+    )
+)
+
+if len(files) != 26:
+
+    print(
+        f"警告：检测到 {len(files)} 张图"
+    )
+
+    if len(files) < 26:
+        raise ValueError(
+            "图像数量不足"
+        )
+
+imgs = []
+
+for idx, f in enumerate(files):
+
+    g = imageio.imread(
+        f
+    )[:, :, 0].astype(
+        np.float32
+    )
+
+    # 坏点修复
+    for x, y in BAD_PIXELS:
+
+        roi = g[
+            y-1:y+2,
+            x-1:x+2
+        ]
+
+        g[y, x] = (
+            np.sum(roi)
+            -
+            g[y, x]
+        ) / 8
+
+    imgs.append(g)
+
+    if (
+        (idx + 1) % 5 == 0
+        or
+        idx == len(files)-1
+    ):
+        print(
+            f"已读取 {idx+1}/{len(files)}"
+        )
+
+imgs = np.stack(imgs)
+
+n_frames, H, W = imgs.shape
+
+print(
+    f"\n图像尺寸: {W} × {H}"
+)
+
+print(
+    f"标定帧数: {n_frames}"
+)
+
+# =====================================================
+# 第一帧检测
+# =====================================================
+
+print("\n检测参考帧光斑...")
+
+coords = peak_local_max(
+    imgs[0],
+    min_distance=min_distance,
+    threshold_abs=threshold_abs
+)
+
+N = len(coords)
+
+print(
+    f"检测到 {N} 个光斑"
+)
+
+xs = np.full(
+    (N, n_frames),
+    np.nan,
+    dtype=np.float32
+)
+
+ys = np.full(
+    (N, n_frames),
+    np.nan,
+    dtype=np.float32
+)
+
+# =====================================================
+# 第一帧亚像素定位
+# =====================================================
+
+print(
+    "\n参考帧亚像素定位..."
+)
+
+for k, (y0, x0) in enumerate(coords):
+
+    y1 = max(
+        int(y0)-roi_radius,
+        0
+    )
+
+    y2 = min(
+        int(y0)+roi_radius+1,
+        H
+    )
+
+    x1 = max(
+        int(x0)-roi_radius,
+        0
+    )
+
+    x2 = min(
+        int(x0)+roi_radius+1,
+        W
+    )
+
+    roi = imgs[
+        0,
+        y1:y2,
+        x1:x2
+    ]
+
+    dx = fit_gauss_center(
+        roi.sum(axis=0)
+    )
+
+    dy = fit_gauss_center(
+        roi.sum(axis=1)
+    )
+
+    xs[k, 0] = x1 + dx
+    ys[k, 0] = y1 + dy
+
+# =====================================================
+# 26帧追踪
+# =====================================================
+
+print(
+    "\n开始追踪26帧..."
+)
+
+for i in range(1, n_frames):
+
+    for k in range(N):
+
+        if np.isnan(
+            xs[k, i-1]
+        ):
+            continue
+
+        x = xs[k, i-1]
+        y = ys[k, i-1]
+
+        y1 = max(
+            int(y)-roi_radius,
+            0
+        )
+
+        y2 = min(
+            int(y)+roi_radius+1,
+            H
+        )
+
+        x1 = max(
+            int(x)-roi_radius,
+            0
+        )
+
+        x2 = min(
+            int(x)+roi_radius+1,
+            W
+        )
+
+        roi = imgs[
+            i,
+            y1:y2,
+            x1:x2
+        ]
+
+        if roi.size == 0:
+            continue
+
+        xs[k, i] = (
+            x1 +
+            fit_gauss_center(
+                roi.sum(axis=0)
+            )
+        )
+
+        ys[k, i] = (
+            y1 +
+            fit_gauss_center(
+                roi.sum(axis=1)
+            )
+        )
+
+    print(
+        f"完成 {i+1}/{n_frames} 帧"
+    )
+
+# =====================================================
+# 建立数据库
+# =====================================================
+
+print(
+    "\n开始建立标定数据库..."
+)
+
+x_ref = []
+y_ref = []
+
+centers = []
+directions = []
+
+coeffs = []
+orders = []
+
+smins = []
+smaxs = []
+
+max_dists = []
+
+spot_ids = []
+
+for k in range(N):
+
+    result = fit_line_pca(
+        xs[k],
+        ys[k]
+    )
+
+    if result is None:
+        continue
+
+    center, direction, maxdist = result
+
+    if maxdist > MAX_OFFLINE_DISTANCE:
+        continue
+
+    vx, vy = direction
+
+    s = (
+        (xs[k]-center[0])*vx
+        +
+        (ys[k]-center[1])*vy
+    )
+
+    valid = ~np.isnan(s)
+
+    if np.sum(valid) < 10:
+        continue
+
+    deg = fit_order(
+        heights_mm,
+        s
+    )
+
+    p = Polynomial.fit(
+        s[valid],
+        heights_mm[valid],
+        deg
+    )
+
+    x_ref.append(xs[k,0])
+    y_ref.append(ys[k,0])
+
+    centers.append(center)
+    directions.append(direction)
+
+    coeffs.append(
+        p.convert().coef[::-1]
+    )
+
+    orders.append(deg)
+
+    smins.append(
+        np.nanmin(s)
+    )
+
+    smaxs.append(
+        np.nanmax(s)
+    )
+
+    max_dists.append(
+        maxdist
+    )
+
+    spot_ids.append(k)
+
+    if (k+1) % 1000 == 0:
+
+        print(
+            f"已处理 {k+1}/{N}"
+        )
+
+# =====================================================
+# 保存
+# =====================================================
+
+np.savez(
+    "spot_database.npz",
+
+    x_ref=np.array(x_ref),
+    y_ref=np.array(y_ref),
+
+    centers=np.array(centers),
+    directions=np.array(directions),
+
+    coeffs=np.array(
+        coeffs,
+        dtype=object
+    ),
+
+    orders=np.array(
+        orders
+    ),
+
+    s_min=np.array(
+        smins
+    ),
+
+    s_max=np.array(
+        smaxs
+    ),
+
+    max_distances=np.array(
+        max_dists
+    ),
+
+    spot_id=np.array(
+        spot_ids
+    )
+)
+
+# =====================================================
+# 统计
+# =====================================================
+
+valid_num = len(x_ref)
+
+print("\n========================================")
+
+print(
+    f"原始光斑数: {N}"
+)
+
+print(
+    f"有效光斑数: {valid_num}"
+)
+
+print(
+    f"剔除光斑数: {N-valid_num}"
+)
+
+print(
+    f"保留比例: "
+    f"{valid_num/N*100:.2f}%"
+)
+
+print(
+    f"平均最大离线距离: "
+    f"{np.mean(max_dists):.4f} pixel"
+)
+
+print(
+    f"最大离线距离: "
+    f"{np.max(max_dists):.4f} pixel"
+)
+
+print(
+    "\n数据库保存成功："
+)
+
+print(
+    "spot_database.npz"
+)
+
+print("========================================")
