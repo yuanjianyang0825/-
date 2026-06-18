@@ -1,0 +1,379 @@
+"""
+reconstruct_3d.py
+
+矩形ROI匹配版
+
+ROI:
+沿运动方向 ±90 pixel
+
+垂直方向 ±2 pixel
+"""
+
+import numpy as np
+import imageio.v2 as imageio
+
+from scipy.optimize import curve_fit
+from scipy.ndimage import center_of_mass
+
+from skimage.feature import peak_local_max
+
+import matplotlib.pyplot as plt
+
+
+# =====================================================
+# 参数
+# =====================================================
+
+database_file = "spot_database.npz"
+
+sample_file = r"C:\Users\A\Desktop\a硬币菊花\1.bmp"
+
+roi_radius = 8
+
+threshold_abs = 35
+min_distance = 20
+
+BAD_PIXELS = [
+    (1207,2750),
+    (373,2688)
+]
+
+TRACK_HALF_LENGTH = 50.0
+TRACK_HALF_WIDTH  = 1.4
+
+
+# =====================================================
+# 高斯拟合
+# =====================================================
+
+def gauss_1d(x,A,mu,sigma,B):
+
+    return A*np.exp(
+        -0.5*((x-mu)/sigma)**2
+    )+B
+
+
+def fit_gauss_center(line):
+
+    x=np.arange(
+        len(line),
+        dtype=float
+    )
+
+    try:
+
+        mu0=np.sum(
+            x*line
+        )/np.sum(line)
+
+        p0=[
+            line.max()-line.min(),
+            mu0,
+            2.0,
+            line.min()
+        ]
+
+        p,_=curve_fit(
+            gauss_1d,
+            x,
+            line,
+            p0=p0,
+            maxfev=1000
+        )
+
+        return p[1]
+
+    except:
+
+        return center_of_mass(line)[0]
+
+
+# =====================================================
+# 数据库
+# =====================================================
+
+print("读取数据库...")
+
+db=np.load(
+    database_file,
+    allow_pickle=True
+)
+
+x_ref=db["x_ref"]
+y_ref=db["y_ref"]
+
+centers=db["centers"]
+directions=db["directions"]
+
+coeffs=db["coeffs"]
+
+s_min=db["s_min"]
+s_max=db["s_max"]
+
+N=len(x_ref)
+
+print(
+    f"数据库光斑数: {N}"
+)
+
+
+# =====================================================
+# 样品图
+# =====================================================
+
+print("读取样品图...")
+
+img=imageio.imread(
+    sample_file
+)
+
+gray=img[:,:,0].astype(
+    np.float32
+)
+
+for x,y in BAD_PIXELS:
+
+    roi=gray[
+        y-1:y+2,
+        x-1:x+2
+    ]
+
+    gray[y,x]=(
+        np.sum(roi)
+        -
+        gray[y,x]
+    )/8
+
+H,W=gray.shape
+
+
+# =====================================================
+# 光斑检测
+# =====================================================
+
+print("检测光斑...")
+
+coords=peak_local_max(
+    gray,
+    min_distance=min_distance,
+    threshold_abs=threshold_abs
+)
+
+print(
+    f"检测到 {len(coords)} 个候选光斑"
+)
+
+xm=[]
+ym=[]
+
+print("亚像素定位...")
+
+for y0,x0 in coords:
+
+    y1=max(
+        int(y0)-roi_radius,
+        0
+    )
+
+    y2=min(
+        int(y0)+roi_radius+1,
+        H
+    )
+
+    x1=max(
+        int(x0)-roi_radius,
+        0
+    )
+
+    x2=min(
+        int(x0)+roi_radius+1,
+        W
+    )
+
+    roi=gray[
+        y1:y2,
+        x1:x2
+    ]
+
+    if roi.size==0:
+        continue
+
+    dx=fit_gauss_center(
+        roi.sum(axis=0)
+    )
+
+    dy=fit_gauss_center(
+        roi.sum(axis=1)
+    )
+
+    xm.append(
+        x1+dx
+    )
+
+    ym.append(
+        y1+dy
+    )
+
+xm=np.array(xm)
+ym=np.array(ym)
+
+M=len(xm)
+
+print(
+    f"有效光斑数: {M}"
+)
+
+
+# =====================================================
+# 匹配
+# =====================================================
+
+print("开始匹配...")
+
+matched=np.zeros(
+    N,
+    dtype=bool
+)
+
+X=[]
+Y=[]
+Z=[]
+
+success=0
+
+for k in range(N):
+
+    cx,cy=centers[k]
+
+    vx,vy=directions[k]
+
+    nx=-vy
+    ny=vx
+
+    dx=xm-cx
+    dy=ym-cy
+
+    s=(
+        dx*vx
+        +
+        dy*vy
+    )
+
+    d=(
+        dx*nx
+        +
+        dy*ny
+    )
+
+    mask=(
+        (np.abs(s)<=TRACK_HALF_LENGTH)
+        &
+        (np.abs(d)<=TRACK_HALF_WIDTH)
+    )
+
+    idx=np.where(mask)[0]
+
+    if len(idx)==0:
+        continue
+
+    best=idx[
+        np.argmin(
+            np.abs(d[idx])
+        )
+    ]
+
+    s_peak=s[best]
+
+    coef=coeffs[k]
+
+    z=np.polyval(
+        coef,
+        s_peak
+    )
+
+    X.append(
+        x_ref[k]
+    )
+
+    Y.append(
+        y_ref[k]
+    )
+
+    Z.append(z)
+
+    matched[k]=True
+
+    success+=1
+
+    if (k+1)%1000==0:
+
+        print(
+            f"{k+1}/{N}"
+        )
+
+
+# =====================================================
+# 保存
+# =====================================================
+
+X=np.array(X)
+Y=np.array(Y)
+Z=np.array(Z)
+
+cloud=np.column_stack(
+    [
+        X,
+        Y,
+        Z
+    ]
+)
+
+np.savetxt(
+    "point_cloud.xyz",
+    cloud,
+    fmt="%.6f"
+)
+
+print()
+
+print(
+    f"匹配成功: {success}"
+)
+
+print(
+    f"匹配率: "
+    f"{100*success/N:.2f}%"
+)
+
+print(
+    "已保存 point_cloud.xyz"
+)
+
+
+# =====================================================
+# 点云显示
+# =====================================================
+
+fig=plt.figure(
+    figsize=(10,8)
+)
+
+ax=fig.add_subplot(
+    111,
+    projection='3d'
+)
+
+ax.scatter(
+    X,
+    Y,
+    Z,
+    s=1
+)
+
+ax.set_xlabel("X")
+ax.set_ylabel("Y")
+ax.set_zlabel("Height(mm)")
+
+plt.tight_layout()
+
+plt.show()
