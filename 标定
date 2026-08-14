@@ -1,7 +1,7 @@
 """
 build_calibration_database.py
 光谱共焦标定数据库生成
-#### 存了误差补偿数据
+存了误差补偿数据
 """
 
 import os
