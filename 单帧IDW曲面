@@ -1,0 +1,714 @@
+"""
+reconstruct_single_frame.py
+
+单帧连续表面重构
+
+流程:
+
+单张样品图
+      ↓
+背景扣除
+      ↓
+光斑检测
+      ↓
+亚像素定位
+      ↓
+数据库匹配
+      ↓
+高度计算 Z
+      ↓
+IDW连续曲面
+      ↓
+3D显示
+"""
+
+import os
+import numpy as np
+import imageio.v2 as imageio
+
+from scipy.optimize import curve_fit
+from scipy.ndimage import center_of_mass
+from scipy.spatial import cKDTree
+
+from skimage.feature import peak_local_max
+
+import matplotlib.pyplot as plt
+
+# =====================================================
+# 参数
+# =====================================================
+
+database_file = "spot_database.npz"
+
+# 单帧样品
+sample_file = r"C:\Users\A\Desktop\硬币超分辨图\12.bmp"
+
+background_file = (
+    r"C:\Users\A\Desktop\硬币超分辨背景图\1.bmp"
+)
+
+roi_radius = 8
+
+threshold_abs = 35
+
+min_distance = 20
+
+PIXEL_SIZE_UM = 3.45
+
+PIXEL_SIZE_MM = PIXEL_SIZE_UM / 1000.0
+
+BAD_PIXELS = [
+
+    (1207,2750),
+
+    (373,2688)
+
+]
+
+# 光斑匹配范围
+
+TRACK_HALF_LENGTH = 50.0
+
+TRACK_HALF_WIDTH = 0.8
+
+# 峰值定位方式
+
+PEAK_METHOD = "gaussian"
+
+LOCAL_HALF_WIDTH = 6
+
+# IDW
+
+IDW_NEIGHBORS = 8
+
+IDW_POWER = 2
+
+IDW_RADIUS = 30
+
+# =====================================================
+# 高斯函数
+# =====================================================
+
+def gauss_1d(x,A,mu,sigma,B):
+
+    return A*np.exp(
+        -0.5*((x-mu)/sigma)**2
+    )+B
+
+def fit_gauss_center(line):
+
+    x=np.arange(
+        len(line),
+        dtype=float
+    )
+
+    try:
+
+        mu0=np.sum(
+            x*line
+        )/np.sum(line)
+
+        p0=[
+
+            line.max()-line.min(),
+
+            mu0,
+
+            2.0,
+
+            line.min()
+
+        ]
+
+        p,_=curve_fit(
+
+            gauss_1d,
+
+            x,
+
+            line,
+
+            p0=p0,
+
+            maxfev=1000
+
+        )
+
+        return p[1]
+
+    except:
+
+        return center_of_mass(line)[0]
+
+def fit_centroid(line):
+
+    x=np.arange(
+        len(line),
+        dtype=float
+    )
+
+    s=np.sum(line)
+
+    if s<=0:
+
+        return center_of_mass(line)[0]
+
+    return np.sum(x*line)/s
+
+def fit_local_centroid(
+        line,
+        half_width=2
+):
+
+    peak=np.argmax(line)
+
+    left=max(
+        peak-half_width,
+        0
+    )
+
+    right=min(
+        peak+half_width+1,
+        len(line)
+    )
+
+    roi=line[left:right]
+
+    x=np.arange(
+        left,
+        right,
+        dtype=float
+    )
+
+    s=np.sum(roi)
+
+    if s<=0:
+
+        return center_of_mass(line)[0]
+
+    return np.sum(x*roi)/s
+
+# =====================================================
+# 读取数据库
+# =====================================================
+
+print("读取数据库...")
+
+db=np.load(
+    database_file,
+    allow_pickle=True
+)
+
+x_ref=db["x_ref"]
+
+y_ref=db["y_ref"]
+
+centers=db["centers"]
+
+directions=db["directions"]
+
+coeffs=db["coeffs"]
+
+N=len(x_ref)
+
+print(
+    f"数据库光斑数:{N}"
+)
+
+# =====================================================
+# 单帧重构函数
+# =====================================================
+
+def reconstruct_one_frame(sample_file):
+
+    print("读取样品:")
+
+    img=imageio.imread(sample_file)
+
+    gray=img[:,:,0].astype(np.float32)
+
+    bg=imageio.imread(
+        background_file
+    )
+
+    background=bg[:,:,0].astype(np.float32)
+
+    # -------------------------
+    # 坏点修复
+    # -------------------------
+
+    for x,y in BAD_PIXELS:
+
+        roi=gray[
+            y-1:y+2,
+            x-1:x+2
+        ]
+
+        gray[y,x]=(
+            np.sum(roi)-gray[y,x]
+        )/8
+
+    for x,y in BAD_PIXELS:
+
+        roi=background[
+            y-1:y+2,
+            x-1:x+2
+        ]
+
+        background[y,x]=(
+            np.sum(roi)-background[y,x]
+        )/8
+
+    gray = gray-background
+
+    gray[gray<0]=0
+
+    H,W=gray.shape
+
+    # =====================================================
+    # 光斑检测
+    # =====================================================
+
+    coords=peak_local_max(
+
+        gray,
+
+        min_distance=min_distance,
+
+        threshold_abs=threshold_abs
+
+    )
+
+    xm=[]
+
+    ym=[]
+
+    for y0,x0 in coords:
+
+        y1=max(
+            int(y0)-roi_radius,
+            0
+        )
+
+        y2=min(
+            int(y0)+roi_radius+1,
+            H
+        )
+
+        x1=max(
+            int(x0)-roi_radius,
+            0
+        )
+
+        x2=min(
+            int(x0)+roi_radius+1,
+            W
+        )
+
+        roi=gray[
+            y1:y2,
+            x1:x2
+        ]
+
+        if roi.size==0:
+
+            continue
+
+        profile_x=roi.sum(axis=0)
+
+        profile_y=roi.sum(axis=1)
+
+        if PEAK_METHOD=="gaussian":
+
+            dx=fit_gauss_center(profile_x)
+
+            dy=fit_gauss_center(profile_y)
+
+        elif PEAK_METHOD=="centroid":
+
+            dx=fit_centroid(profile_x)
+
+            dy=fit_centroid(profile_y)
+
+        else:
+
+            dx=fit_local_centroid(
+                profile_x,
+                LOCAL_HALF_WIDTH
+            )
+
+            dy=fit_local_centroid(
+                profile_y,
+                LOCAL_HALF_WIDTH
+            )
+
+        xm.append(
+            x1+dx
+        )
+
+        ym.append(
+            y1+dy
+        )
+
+    xm=np.array(xm)
+
+    ym=np.array(ym)
+
+    print(
+        "检测光斑:",
+        len(xm)
+    )
+
+    # =====================================================
+    # 数据库匹配
+    # =====================================================
+
+    Z_detect=np.full(
+        N,
+        np.nan
+    )
+
+    X=[]
+
+    Y=[]
+
+    Z=[]
+
+    for k in range(N):
+
+        cx,cy=centers[k]
+
+        vx,vy=directions[k]
+
+        nx=-vy
+
+        ny=vx
+
+        dx=xm-cx
+
+        dy=ym-cy
+
+        s=dx*vx+dy*vy
+
+        d=dx*nx+dy*ny
+
+        mask=(
+
+            (np.abs(s)<=TRACK_HALF_LENGTH)
+
+            &
+
+            (np.abs(d)<=TRACK_HALF_WIDTH)
+
+        )
+
+        idx=np.where(mask)[0]
+
+        if len(idx)==0:
+
+            continue
+
+        best=idx[
+            np.argmin(
+                np.abs(d[idx])
+            )
+        ]
+
+        s_peak=s[best]
+
+        z=np.polyval(
+
+            coeffs[k],
+
+            s_peak
+
+        )
+
+        Z_detect[k]=z
+
+        X.append(
+            x_ref[k]
+        )
+
+        Y.append(
+            y_ref[k]
+        )
+
+        Z.append(z)
+
+    # =====================================================
+    # 高度离群点剔除
+    # =====================================================
+
+    OUTLIER_THRESHOLD = 0.7
+
+    Z_array=np.array(Z)
+
+    z_center=np.median(Z_array)
+
+    mask=np.abs(
+        Z_array-z_center
+    ) < OUTLIER_THRESHOLD
+
+    X=np.array(X)[mask]
+
+    Y=np.array(Y)[mask]
+
+    Z_array=Z_array[mask]
+
+    print(
+        "剔除离群点:",
+        np.sum(~mask)
+    )
+
+    return X,Y,Z_array
+
+# =====================================================
+# 执行单帧
+# =====================================================
+
+X_total,Y_total,Z_total = reconstruct_one_frame(
+    sample_file
+)
+
+print(
+    "有效测量点:",
+    len(Z_total)
+)
+
+# =====================================================
+# IDW连续曲面
+# =====================================================
+
+xmin=X_total.min()
+
+xmax=X_total.max()
+
+ymin=Y_total.min()
+
+ymax=Y_total.max()
+
+GRID_STEP=30
+
+xi=np.arange(
+    xmin,
+    xmax,
+    GRID_STEP
+)
+
+yi=np.arange(
+    ymin,
+    ymax,
+    GRID_STEP
+)
+
+grid_x,grid_y=np.meshgrid(
+    xi,
+    yi
+)
+
+tree=cKDTree(
+
+    np.column_stack(
+        (
+            X_total,
+            Y_total
+        )
+    )
+
+)
+
+grid_z=np.full(
+    grid_x.shape,
+    np.nan
+)
+
+rows,cols=grid_x.shape
+
+for r in range(rows):
+
+    print(
+        f"\rIDW {r+1}/{rows}",
+        end=""
+    )
+
+    for c in range(cols):
+
+        pt=np.array([
+
+            grid_x[r,c],
+
+            grid_y[r,c]
+
+        ])
+
+        dist,idx=tree.query(
+
+            pt,
+
+            k=IDW_NEIGHBORS,
+
+            distance_upper_bound=IDW_RADIUS
+
+        )
+
+        dist=np.atleast_1d(dist)
+
+        idx=np.atleast_1d(idx)
+
+        valid=np.isfinite(dist)
+
+        valid &= idx<len(Z_total)
+
+        if np.sum(valid)==0:
+
+            continue
+
+        dist=dist[valid]
+
+        idx=idx[valid]
+
+        dist=np.maximum(
+            dist,
+            1e-6
+        )
+
+        w=1/dist**IDW_POWER
+
+        w=w/w.sum()
+
+        grid_z[r,c]=np.sum(
+
+            w*Z_total[idx]
+
+        )
+
+valid=np.isfinite(grid_z)
+
+print(
+
+    "\n有效网格:",
+
+    np.count_nonzero(valid)
+
+)
+
+# =====================================================
+# 保存点云
+# =====================================================
+
+grid_x_mm=grid_x*PIXEL_SIZE_MM
+
+grid_y_mm=grid_y*PIXEL_SIZE_MM
+
+cloud=np.column_stack(
+
+    (
+
+        grid_x_mm[valid],
+
+        grid_y_mm[valid],
+
+        grid_z[valid]
+
+    )
+
+)
+
+np.savetxt(
+
+    "single_frame_surface.xyz",
+
+    cloud,
+
+    fmt="%.6f"
+
+)
+
+print(
+    "保存 single_frame_surface.xyz"
+)
+
+# =====================================================
+# 3D显示
+# =====================================================
+
+fig=plt.figure(
+    figsize=(10,8)
+)
+
+ax=fig.add_subplot(
+
+    111,
+
+    projection="3d"
+
+)
+
+surf=ax.plot_surface(
+
+    grid_x_mm,
+
+    grid_y_mm,
+
+    grid_z,
+
+    cmap="viridis",
+
+    linewidth=0
+
+)
+
+ax.set_xlabel(
+    "X(mm)"
+)
+
+ax.set_ylabel(
+    "Y(mm)"
+)
+
+ax.set_zlabel(
+    "Height(mm)"
+)
+
+# =====================================================
+# XYZ等比例显示
+# =====================================================
+
+
+# 获取三个方向范围
+
+x_range = grid_x_mm.max() - grid_x_mm.min()
+
+y_range = grid_y_mm.max() - grid_y_mm.min()
+
+
+z_valid = grid_z[np.isfinite(grid_z)]
+
+z_range = z_valid.max() - z_valid.min()
+
+
+# 设置XYZ真实比例
+
+ax.set_box_aspect(
+    (
+        x_range,
+        y_range,
+        z_range
+    )
+)
+
+
+ax.view_init(
+    elev=30,
+    azim=-60
+)
+
+
+plt.colorbar(
+    surf,
+    shrink=0.6
+)
+
+
+plt.show()
