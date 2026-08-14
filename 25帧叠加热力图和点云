@@ -1,0 +1,693 @@
+"""
+reconstruct_3d.py
+
+矩形ROI匹配版
+
+ROI:
+沿运动方向 ±90 pixel
+
+垂直方向 ±2 pixel
+"""
+
+import os
+import numpy as np
+import imageio.v2 as imageio
+
+from scipy.optimize import curve_fit
+from scipy.ndimage import center_of_mass
+from scipy.spatial import cKDTree
+
+from skimage.feature import peak_local_max
+
+import matplotlib.pyplot as plt
+
+
+# ========== 解决中文显示问题 ==========
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 使用黑体，Windows一般都有
+plt.rcParams['axes.unicode_minus'] = False    # 解决负号显示问题
+# =====================================
+
+
+# =====================================================
+# 参数
+# =====================================================
+
+database_file = "spot_database.npz"
+
+sample_folder = r"C:\Users\A\Desktop\硬币超分辨图"
+
+FRAME_NUM = 25
+
+background_file = r"C:\Users\A\Desktop\硬币超分辨背景图\1.bmp"
+
+roi_radius = 8
+
+threshold_abs = 35
+min_distance = 20
+
+BAD_PIXELS = [
+    (1207,2750),
+    (373,2688)
+]
+
+TRACK_HALF_LENGTH = 50.0
+TRACK_HALF_WIDTH  = 0.8
+
+# 峰值定位方法
+# gaussian        高斯拟合
+# centroid        全ROI质心
+# local_centroid  局部质心
+PEAK_METHOD = "gaussian"
+
+# 局部质心窗口半宽（单位：pixel）
+LOCAL_HALF_WIDTH = 6
+
+#IDW参数
+IDW_NEIGHBORS = 6
+IDW_POWER = 2
+IDW_RADIUS = 12
+
+# =====================================================
+# 高斯拟合
+# =====================================================
+
+def gauss_1d(x,A,mu,sigma,B):
+
+    return A*np.exp(
+        -0.5*((x-mu)/sigma)**2
+    )+B
+
+
+def fit_gauss_center(line):
+
+    x=np.arange(
+        len(line),
+        dtype=float
+    )
+
+    try:
+
+        mu0=np.sum(
+            x*line
+        )/np.sum(line)
+
+        p0=[
+            line.max()-line.min(),
+            mu0,
+            2.0,
+            line.min()
+        ]
+
+        p,_=curve_fit(
+            gauss_1d,
+            x,
+            line,
+            p0=p0,
+            maxfev=1000
+        )
+
+        return p[1]
+
+    except:
+
+        return center_of_mass(line)[0]
+
+
+def fit_centroid(line):
+
+    x = np.arange(
+        len(line),
+        dtype=float
+    )
+
+    s = np.sum(line)
+
+    if s <= 0:
+        return center_of_mass(line)[0]
+
+    return np.sum(
+        x * line
+    ) / s
+
+
+def fit_local_centroid(
+        line,
+        half_width=2
+):
+
+    peak = np.argmax(line)
+
+    left = max(
+        peak-half_width,
+        0
+    )
+
+    right = min(
+        peak+half_width+1,
+        len(line)
+    )
+
+    roi = line[left:right]
+
+    x = np.arange(
+        left,
+        right,
+        dtype=float
+    )
+
+    s = np.sum(roi)
+
+    if s <= 0:
+
+        return center_of_mass(line)[0]
+
+    return np.sum(
+        x*roi
+    )/s
+
+
+# =====================================================
+# 数据库
+# =====================================================
+
+print("读取数据库...")
+
+db=np.load(
+    database_file,
+    allow_pickle=True
+)
+
+x_ref=db["x_ref"]
+y_ref=db["y_ref"]
+
+centers=db["centers"]
+directions=db["directions"]
+
+coeffs=db["coeffs"]
+
+s_min=db["s_min"]
+s_max=db["s_max"]
+
+N=len(x_ref)
+
+print(
+    f"数据库光斑数: {N}"
+)
+
+
+# =====================================================
+# 样品图
+# =====================================================
+
+
+def reconstruct_one_frame(sample_file):
+
+
+
+    img=imageio.imread(sample_file)
+    gray=img[:,:,0].astype(np.float32)
+
+
+    bg=imageio.imread(background_file)
+    background=bg[:,:,0].astype(np.float32)
+
+    for x,y in BAD_PIXELS:
+
+        roi=gray[
+            y-1:y+2,
+            x-1:x+2
+        ]
+
+        gray[y,x]=(
+            np.sum(roi)-gray[y,x]
+        )/8
+
+    for x,y in BAD_PIXELS:
+
+        roi=background[
+            y-1:y+2,
+            x-1:x+2
+        ]
+
+        background[y,x]=(
+            np.sum(roi)-background[y,x]
+        )/8
+
+    gray = gray - background
+
+    gray[gray < 0] = 0
+
+    H,W=gray.shape
+
+
+    # =====================================================
+    # 光斑检测
+    # =====================================================
+
+
+    coords=peak_local_max(
+        gray,
+        min_distance=min_distance,
+        threshold_abs=threshold_abs
+    )
+
+
+    xm=[]
+    ym=[]
+
+
+    for y0,x0 in coords:
+
+        y1=max(
+            int(y0)-roi_radius,
+            0
+        )
+
+        y2=min(
+            int(y0)+roi_radius+1,
+            H
+        )
+
+        x1=max(
+            int(x0)-roi_radius,
+            0
+        )
+
+        x2=min(
+            int(x0)+roi_radius+1,
+            W
+        )
+
+        roi=gray[
+            y1:y2,
+            x1:x2
+        ]
+
+        if roi.size==0:
+            continue
+
+        profile_x = roi.sum(axis=0)
+        profile_y = roi.sum(axis=1)
+
+        if PEAK_METHOD == "gaussian":
+
+            dx = fit_gauss_center(profile_x)
+            dy = fit_gauss_center(profile_y)
+
+        elif PEAK_METHOD == "centroid":
+
+            dx = fit_centroid(profile_x)
+            dy = fit_centroid(profile_y)
+
+        elif PEAK_METHOD == "local_centroid":
+
+            dx = fit_local_centroid(
+                profile_x,
+                LOCAL_HALF_WIDTH
+            )
+
+            dy = fit_local_centroid(
+                profile_y,
+                LOCAL_HALF_WIDTH
+            )
+
+        else:
+
+            raise ValueError(
+                "Unknown PEAK_METHOD"
+            )
+        
+        xm.append(
+            x1+dx
+        )
+
+        ym.append(
+            y1+dy
+        )
+
+    xm=np.array(xm)
+    ym=np.array(ym)
+
+    M=len(xm)
+
+
+
+    # =====================================================
+    # 匹配
+    # =====================================================
+
+
+
+    Z_detect = np.full(N, np.nan)
+
+    X=[]
+    Y=[]
+    Z=[]
+
+    # 调试信息
+    spot_id=[]
+
+
+    for k in range(N):
+
+        cx,cy=centers[k]
+
+        vx,vy=directions[k]
+
+        nx=-vy
+        ny=vx
+
+        dx=xm-cx
+        dy=ym-cy
+
+        s=(
+            dx*vx
+            +
+            dy*vy
+        )
+
+        d=(
+            dx*nx
+            +
+            dy*ny
+        )
+
+        mask=(
+            (np.abs(s)<=TRACK_HALF_LENGTH)
+            &
+            (np.abs(d)<=TRACK_HALF_WIDTH)
+        )
+
+        idx=np.where(mask)[0]
+
+        if len(idx)==0:
+            continue
+
+        best=idx[
+            np.argmin(
+                np.abs(d[idx])
+            )
+        ]
+
+
+        
+        s_peak=s[best]
+
+        coef=coeffs[k]
+
+        z=np.polyval(
+            coef,
+            s_peak
+        )
+
+        Z_detect[k] = z
+
+        X.append(
+            x_ref[k]
+        )
+
+        Y.append(
+            y_ref[k]
+        )
+
+        Z.append(z)
+
+        # 调试信息
+        spot_id.append(k)
+
+
+
+
+    
+    # =====================================================
+    # 删除高度离群点
+    # =====================================================
+
+    OUTLIER_THRESHOLD = 0.7   # mm
+
+    # 只统计有效点
+    X=np.array(X)
+    Y=np.array(Y)
+    Z=np.array(Z)
+
+    valid=np.isfinite(Z)
+
+    # 使用中位数，比平均值稳定
+    z_center = np.median(Z[valid])
+
+    # 判断离群点
+    spot_id = np.array(spot_id)
+
+    outlier = np.abs(
+        Z - z_center
+    ) > OUTLIER_THRESHOLD
+
+    print(f"检测到离群点：{np.sum(outlier)} 个")
+
+    bad_index = spot_id[outlier]
+
+    Z_detect[bad_index] = np.nan
+
+    return Z_detect
+
+
+X_total=[]
+
+Y_total=[]
+
+Z_total=[]
+
+dx=-0.128
+
+dy=-5.866
+
+for frame in range(1,26):
+    print(f"\n========== 正在处理第 {frame}/25 张图 ==========")
+    sample_file=os.path.join(
+    sample_folder,
+    f"{frame}.bmp"
+    )
+    Z_frame = reconstruct_one_frame(sample_file)
+
+    shift_x=(frame-1)*dx
+
+    shift_y=(frame-1)*dy
+
+    for k in range(N):
+
+        if np.isnan(Z_frame[k]):
+            continue
+
+        X_total.append(
+            x_ref[k]+shift_x
+        )
+
+        Y_total.append(
+            y_ref[k]+shift_y
+        )
+
+        Z_total.append(
+            Z_frame[k]
+        )
+    
+
+
+
+X_total=np.array(X_total)
+
+Y_total=np.array(Y_total)
+
+Z_total=np.array(Z_total)
+
+
+
+grid_x=[]
+
+grid_y=[]
+
+
+
+for frame in range(25):
+
+    sx=frame*dx
+
+    sy=frame*dy
+
+    grid_x.append(
+        x_ref+sx
+    )
+
+    grid_y.append(
+        y_ref+sy
+    )
+
+grid_x=np.concatenate(grid_x)
+
+grid_y=np.concatenate(grid_y)
+
+tree=cKDTree(
+np.column_stack(
+(
+X_total,
+Y_total
+)
+)
+)
+
+grid_z=np.full(
+    len(grid_x),
+    np.nan
+)
+
+for i in range(len(grid_x)):
+
+    pt=np.array([
+        grid_x[i],
+        grid_y[i]
+    ])
+
+    # 如果该位置本身就是测量点，直接使用真实高度
+    d0, idx0 = tree.query(pt, k=1)
+
+    if d0 < 1e-6:
+        grid_z[i] = Z_total[idx0]
+        continue
+
+    dist,idx=tree.query(
+        pt,
+        k=IDW_NEIGHBORS,
+        distance_upper_bound=IDW_RADIUS
+    )
+
+    dist=np.atleast_1d(dist)
+    idx=np.atleast_1d(idx)
+
+    valid=np.isfinite(dist)
+
+    valid &= idx < len(Z_total)
+
+    if np.sum(valid)==0:
+
+        grid_z[i]=np.nan
+        continue
+
+    dist=dist[valid]
+    idx=idx[valid]
+
+    dist=np.maximum(
+        dist,
+        1e-6
+    )
+
+    w=1/dist**IDW_POWER
+
+    w/=w.sum()
+
+    grid_z[i]=np.sum(
+        w*Z_total[idx]
+    )
+
+
+
+valid = np.isfinite(grid_z)
+
+print("有效测量点:", len(Z_total))
+print("超分辨点:", np.sum(valid))
+
+cloud = np.column_stack((grid_x[valid], grid_y[valid], grid_z[valid]))
+np.savetxt("super_resolution.xyz", cloud, fmt="%.6f")
+
+# =====================================================
+# 可视化：2D热力图 + 3D点云（双图并排）
+# =====================================================
+
+# 热力图：使用全局最小最大值（不截断）
+vmin_heat = np.nanmin(grid_z[valid])
+vmax_heat = np.nanmax(grid_z[valid])
+
+# 3D点云：使用百分位数截断（去除两端0.5%极端值）
+vmin_3d = np.percentile(grid_z[valid], 0.5)
+vmax_3d = np.percentile(grid_z[valid], 99.5)
+
+
+
+# # 先计算统一的颜色范围（基于超分辨数据）
+# vmin = np.percentile(grid_z[valid], 0.5)
+# vmax = np.percentile(grid_z[valid], 99.5)
+
+# vmin = np.nanmin(grid_z[valid])
+# vmax = np.nanmax(grid_z[valid])
+
+
+# ---------- 图1: 2D 热力图 ----------
+fig1 = plt.figure(figsize=(10, 8))
+ax1 = fig1.add_subplot(111)
+
+sc1 = ax1.scatter(
+    grid_x[valid],
+    grid_y[valid],
+    c=grid_z[valid],
+    cmap="turbo",
+    s=2,
+    alpha=0.7,
+    vmin=vmin_heat,
+    vmax=vmax_heat
+)
+
+ax1.set_xlabel("X (pixel)", fontsize=12)
+ax1.set_ylabel("Y (pixel)", fontsize=12)
+ax1.set_title(
+    f"25帧超分辨点云 (2D热力图)\n超分辨点: {np.sum(valid)} 个",
+    fontsize=14,
+    fontweight='bold'
+)
+ax1.set_aspect('equal')
+
+cbar1 = plt.colorbar(sc1, ax=ax1, pad=0.02)
+cbar1.set_label("Height (mm)", fontsize=12)
+
+plt.tight_layout()
+plt.show()
+
+
+
+# ---------- 图2: 3D 点云 ----------
+fig2 = plt.figure(figsize=(10, 8))
+ax2 = fig2.add_subplot(111, projection="3d")
+
+sc2 = ax2.scatter(
+    grid_x[valid],
+    grid_y[valid],
+    grid_z[valid],
+    c=grid_z[valid],
+    cmap="turbo",
+    s=1,
+    vmin=vmin_3d,
+    vmax=vmax_3d
+)
+
+# 放大Z轴显示效果
+z_center = (np.nanmin(grid_z[valid]) + np.nanmax(grid_z[valid])) / 2
+z_range  = (np.nanmax(grid_z[valid]) - np.nanmin(grid_z[valid]))
+VISUAL_Z_SCALE = 15
+
+ax2.set_zlim(
+    z_center - z_range/2 * VISUAL_Z_SCALE,
+    z_center + z_range/2 * VISUAL_Z_SCALE
+)
+
+ax2.set_xlabel("X (pixel)", fontsize=12, labelpad=8)
+ax2.set_ylabel("Y (pixel)", fontsize=12, labelpad=8)
+ax2.set_zlabel("Height (mm)", fontsize=12, labelpad=8)
+ax2.set_title(
+    f"25帧超分辨点云 (3D视图)\n超分辨点: {np.sum(valid)} 个",
+    fontsize=14,
+    fontweight='bold'
+)
+
+cbar2 = plt.colorbar(sc2, ax=ax2, pad=0.1, shrink=0.6)
+cbar2.set_label("Height (mm)", fontsize=12)
+
+plt.tight_layout()
+plt.show()
+
