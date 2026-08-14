@@ -1,6 +1,7 @@
 """
 build_calibration_database.py
 光谱共焦标定数据库生成
+#### 存了误差补偿数据
 """
 
 import os
@@ -17,12 +18,10 @@ from numpy.polynomial import Polynomial
 # 参数
 # =====================================================
 
-calib_dir = r"C:\Users\A\Desktop\a标定用"
-
+calib_dir = r"C:\Users\A\Desktop\3w曝光标定图"
+dark_image_path = r"C:\Users\A\Desktop\3w曝光背景\1.bmp"
 heights_mm = np.linspace(2.5, 0, 26)
-
 roi_radius = 8
-
 threshold_abs = 35
 min_distance = 20
 
@@ -32,6 +31,24 @@ BAD_PIXELS = [
 ]
 
 MAX_OFFLINE_DISTANCE = 0.5
+
+
+# =====================================================
+# 读取暗背景
+# =====================================================
+if os.path.exists(dark_image_path):
+    dark = imageio.imread(dark_image_path)[:, :, 0].astype(np.float32)
+    # 对暗背景也执行坏点修复（与标定图像保持一致）
+    for x, y in BAD_PIXELS:
+        roi = dark[y-1:y+2, x-1:x+2]
+        dark[y, x] = (np.sum(roi) - dark[y, x]) / 8
+    print("暗背景读取并修复完成")
+else:
+    dark = None
+    print("警告：未找到暗背景图像，不进行背景扣除")
+
+# =====================================================
+
 
 # =====================================================
 # 高斯拟合
@@ -192,82 +209,46 @@ def fit_line_pca(x, y):
 # =====================================================
 # 读取图像
 # =====================================================
-
+# 读取标定图像（每帧减去暗背景）
+# =====================================================
 print("\n==============================")
 print("读取标定图像")
 print("==============================")
 
 files = sorted(
-    glob.glob(
-        os.path.join(
-            calib_dir,
-            "*.bmp"
-        )
-    ),
-    key=lambda p: int(
-        os.path.splitext(
-            os.path.basename(p)
-        )[0]
-    )
+    glob.glob(os.path.join(calib_dir, "*.bmp")),
+    key=lambda p: int(os.path.splitext(os.path.basename(p))[0])
 )
 
 if len(files) != 26:
-
-    print(
-        f"警告：检测到 {len(files)} 张图"
-    )
-
+    print(f"警告：检测到 {len(files)} 张图")
     if len(files) < 26:
-        raise ValueError(
-            "图像数量不足"
-        )
+        raise ValueError("图像数量不足")
 
 imgs = []
-
 for idx, f in enumerate(files):
-
-    g = imageio.imread(
-        f
-    )[:, :, 0].astype(
-        np.float32
-    )
+    g = imageio.imread(f)[:, :, 0].astype(np.float32)
 
     # 坏点修复
     for x, y in BAD_PIXELS:
+        roi = g[y-1:y+2, x-1:x+2]
+        g[y, x] = (np.sum(roi) - g[y, x]) / 8
 
-        roi = g[
-            y-1:y+2,
-            x-1:x+2
-        ]
-
-        g[y, x] = (
-            np.sum(roi)
-            -
-            g[y, x]
-        ) / 8
+    # 减去暗背景（若存在）
+    if dark is not None:
+        g = g - dark
+        g = np.clip(g, 0, None)   # 避免负值影响拟合
 
     imgs.append(g)
 
-    if (
-        (idx + 1) % 5 == 0
-        or
-        idx == len(files)-1
-    ):
-        print(
-            f"已读取 {idx+1}/{len(files)}"
-        )
+    if (idx + 1) % 5 == 0 or idx == len(files)-1:
+        print(f"已读取 {idx+1}/{len(files)}")
 
 imgs = np.stack(imgs)
-
 n_frames, H, W = imgs.shape
+print(f"\n图像尺寸: {W} × {H}")
+print(f"标定帧数: {n_frames}")
 
-print(
-    f"\n图像尺寸: {W} × {H}"
-)
-
-print(
-    f"标定帧数: {n_frames}"
-)
 
 # =====================================================
 # 第一帧检测
@@ -437,6 +418,11 @@ max_dists = []
 
 spot_ids = []
 
+xs_valid = []
+ys_valid = []
+
+errors = []
+
 for k in range(N):
 
     result = fit_line_pca(
@@ -476,8 +462,32 @@ for k in range(N):
         deg
     )
 
+    # =================================================
+    # 计算标定残差误差
+    # =================================================
+
+    z_fit = p(s[valid])
+
+    error = heights_mm[valid] - z_fit
+
+
+    # 保存该spot的26个高度误差
+    error_full = np.full(
+        n_frames,
+        np.nan
+    )
+
+    error_full[valid] = error
+
+    errors.append(
+        error_full
+    )
+    
     x_ref.append(xs[k,0])
     y_ref.append(ys[k,0])
+
+    xs_valid.append(xs[k].copy())
+    ys_valid.append(ys[k].copy())
 
     centers.append(center)
     directions.append(direction)
@@ -544,7 +554,20 @@ np.savez(
 
     spot_id=np.array(
         spot_ids
-    )
+    ),
+
+    xs=xs,
+    ys=ys,
+
+    xs_valid=np.array(xs_valid),
+    ys_valid=np.array(ys_valid),
+
+    errors=np.array(errors),
+
+    
+    heights=heights_mm
+
+    
 )
 
 # =====================================================
@@ -590,4 +613,32 @@ print(
     "spot_database.npz"
 )
 
+errors = np.array(errors)
+
+
+valid_error = errors[np.isfinite(errors)]
+
+
+rms_error = np.sqrt(
+    np.mean(valid_error**2)
+)
+
+
+max_error = np.max(
+    np.abs(valid_error)
+)
+
+
+print(
+    f"\n整体标定RMS误差: "
+    f"{rms_error*1000:.3f} um"
+)
+
+
+print(
+    f"整体最大误差: "
+    f"{max_error*1000:.3f} um"
+)
+
 print("========================================")
+
