@@ -1,7 +1,7 @@
 """
 build_calibration_database.py
 光谱共焦标定数据库生成
-存了误差补偿数据
+#### 存了误差补偿数据
 """
 
 import os
@@ -18,37 +18,23 @@ from numpy.polynomial import Polynomial
 # 参数
 # =====================================================
 
-calib_dir = r"C:\Users\A\Desktop\3w曝光标定图"
-dark_image_path = r"C:\Users\A\Desktop\3w曝光背景\1.bmp"
-heights_mm = np.linspace(2.5, 0, 26)
-roi_radius = 8
+calib_dir = r"C:\Users\A\Desktop\标定图集"
+dark_image_path = r"C:\Users\A\Desktop\Image-Captured-At10-17-18-02-56\1.bmp"
+heights_mm = np.linspace(2.7, 0, 28)
+roi_radius_x = 3   # x方向ROI半径
+roi_radius_y = 5   # y方向ROI半径
 threshold_abs = 35
 min_distance = 20
-
-BAD_PIXELS = [
-    (1207, 2750),
-    (373, 2688)
-]
-
 MAX_OFFLINE_DISTANCE = 0.5
 
+# 单个光斑最大残差阈值：超过 5 um 就剔除该光斑
+# 5 um = 0.005 mm
+MAX_SPOT_ERROR_MM = 0.005
 
 # =====================================================
 # 读取暗背景
 # =====================================================
-if os.path.exists(dark_image_path):
-    dark = imageio.imread(dark_image_path)[:, :, 0].astype(np.float32)
-    # 对暗背景也执行坏点修复（与标定图像保持一致）
-    for x, y in BAD_PIXELS:
-        roi = dark[y-1:y+2, x-1:x+2]
-        dark[y, x] = (np.sum(roi) - dark[y, x]) / 8
-    print("暗背景读取并修复完成")
-else:
-    dark = None
-    print("警告：未找到暗背景图像，不进行背景扣除")
-
-# =====================================================
-
+dark = imageio.imread(dark_image_path)[:, :, 0].astype(np.float32)
 
 # =====================================================
 # 高斯拟合
@@ -61,25 +47,38 @@ def gauss_1d(x, A, mu, sigma, B):
 
 
 def fit_gauss_center(line):
-
-    x = np.arange(
-        len(line),
-        dtype=float
-    )
+    """
+    对一维投影曲线进行高斯拟合，返回亚像素中心位置
+    采用自适应 sigma 初猜（加权标准差）
+    """
+    x = np.arange(len(line), dtype=float)
+    total = np.sum(line)
+    
+    # 防呆处理：如果总强度为0，直接返回质心（或中点）作为保底
+    if total == 0:
+        return len(line) / 2.0
 
     try:
-
-        mu0 = np.sum(
-            x * line
-        ) / np.sum(line)
-
+        # 1. 质心法计算 mu 初猜
+        mu0 = np.sum(x * line) / total
+        
+        # 2. ===== 核心改动：自适应计算 sigma 初猜 =====
+        # 计算加权二阶中心矩（即加权标准差）
+        sigma0 = np.sqrt(np.sum(line * (x - mu0) ** 2) / total)
+        
+        # 3. 安全保护：防止 sigma 极瘦（<0.1px）或极胖（>10px）或出现 NaN
+        if not np.isfinite(sigma0) or sigma0 < 0.1 or sigma0 > 10:
+            sigma0 = 2.0  # 极端情况下的保底值
+        
+        # 4. 构造初猜参数 [振幅, 中心, 标准差, 背景]
         p0 = [
             line.max() - line.min(),
             mu0,
-            2.0,
+            sigma0,          # 这里不再是固定的 2.0
             line.min()
         ]
 
+        # 5. 执行高斯拟合
         popt, _ = curve_fit(
             gauss_1d,
             x,
@@ -87,11 +86,10 @@ def fit_gauss_center(line):
             p0=p0,
             maxfev=1000
         )
+        return popt[1]  # 返回拟合出的中心 mu
 
-        return popt[1]
-
-    except:
-
+    except Exception:
+        # 如果拟合失败，退回到质心法（一阶矩）
         return center_of_mass(line)[0]
 
 
@@ -99,51 +97,61 @@ def fit_gauss_center(line):
 # 自动选阶
 # =====================================================
 
-def fit_order(z, y,
-              max_order=3,
-              thresh=0.05):
+def fit_order(
+        s,
+        z,
+        max_order=4,
+        rmse_threshold=0.001):
+    """
+    自动选择 z=f(s) 的多项式阶数
 
-    valid = ~np.isnan(y)
+    目标：
+    选择最低阶多项式，使拟合RMSE <= 1um
 
+    参数:
+    s: 光斑位移(pixel)
+    z: 高度(mm)
+
+    rmse_threshold:
+        RMSE阈值(mm)
+        0.001 mm = 1 um
+    """
+
+    valid = ~np.isnan(s)
+
+    s = s[valid]
     z = z[valid]
-    y = y[valid]
 
-    if len(z) < 3:
-        return 1
 
-    best_deg = 1
+    best_deg = max_order
 
-    prev_res = np.std(
-        y - Polynomial.fit(
-            z,
-            y,
-            1
-        )(z)
-    )
 
-    for deg in range(
-        2,
-        min(
-            max_order + 1,
-            len(z)
-        )
-    ):
+    for deg in range(1, max_order+1):
 
         p = Polynomial.fit(
+            s,
             z,
-            y,
             deg
         )
 
-        res = np.std(
-            y - p(z)
+
+        residual = z - p(s)
+
+
+        rmse = np.sqrt(
+            np.mean(
+                residual**2
+            )
         )
 
-        if prev_res - res < thresh:
+
+        # 如果当前阶数已经满足1um要求
+        if rmse <= rmse_threshold:
+
+            best_deg = deg
+
             break
 
-        prev_res = res
-        best_deg = deg
 
     return best_deg
 
@@ -220,19 +228,12 @@ files = sorted(
     key=lambda p: int(os.path.splitext(os.path.basename(p))[0])
 )
 
-if len(files) != 26:
-    print(f"警告：检测到 {len(files)} 张图")
-    if len(files) < 26:
-        raise ValueError("图像数量不足")
+if len(files) != 28:
+    raise ValueError(f"必须恰好有 28 张标定图，当前检测到 {len(files)} 张")
 
 imgs = []
 for idx, f in enumerate(files):
     g = imageio.imread(f)[:, :, 0].astype(np.float32)
-
-    # 坏点修复
-    for x, y in BAD_PIXELS:
-        roi = g[y-1:y+2, x-1:x+2]
-        g[y, x] = (np.sum(roi) - g[y, x]) / 8
 
     # 减去暗背景（若存在）
     if dark is not None:
@@ -291,22 +292,22 @@ print(
 for k, (y0, x0) in enumerate(coords):
 
     y1 = max(
-        int(y0)-roi_radius,
+        int(y0)-roi_radius_y,
         0
     )
 
     y2 = min(
-        int(y0)+roi_radius+1,
+        int(y0)+roi_radius_y+1,
         H
     )
 
     x1 = max(
-        int(x0)-roi_radius,
+        int(x0)-roi_radius_x,
         0
     )
 
     x2 = min(
-        int(x0)+roi_radius+1,
+        int(x0)+roi_radius_x+1,
         W
     )
 
@@ -332,7 +333,7 @@ for k, (y0, x0) in enumerate(coords):
 # =====================================================
 
 print(
-    "\n开始追踪26帧..."
+    "\n开始追踪30帧..."
 )
 
 for i in range(1, n_frames):
@@ -345,25 +346,25 @@ for i in range(1, n_frames):
             continue
 
         x = xs[k, i-1]
-        y = ys[k, i-1]
+        y = ys[k, i-1] - 3
 
         y1 = max(
-            int(y)-roi_radius,
+            int(y)-roi_radius_y,
             0
         )
 
         y2 = min(
-            int(y)+roi_radius+1,
+            int(y)+roi_radius_y+1,
             H
         )
 
         x1 = max(
-            int(x)-roi_radius,
+            int(x)-roi_radius_x,
             0
         )
 
         x2 = min(
-            int(x)+roi_radius+1,
+            int(x)+roi_radius_x+1,
             W
         )
 
@@ -422,6 +423,9 @@ xs_valid = []
 ys_valid = []
 
 errors = []
+s_values = []
+
+rejected_by_error = 0
 
 for k in range(N):
 
@@ -452,8 +456,8 @@ for k in range(N):
         continue
 
     deg = fit_order(
-        heights_mm,
-        s
+        s,
+        heights_mm
     )
 
     p = Polynomial.fit(
@@ -461,6 +465,8 @@ for k in range(N):
         heights_mm[valid],
         deg
     )
+
+
 
     # =================================================
     # 计算标定残差误差
@@ -479,15 +485,35 @@ for k in range(N):
 
     error_full[valid] = error
 
+    # =================================================
+    # 按单光斑最大残差剔除
+    # =================================================
+    if np.any(np.isfinite(error_full)):
+        spot_max_error = np.nanmax(np.abs(error_full))
+    else:
+        spot_max_error = np.inf
+
+    if spot_max_error > MAX_SPOT_ERROR_MM:
+        # 该光斑误差超阈值，直接跳过，不加入数据库
+        print(f"spot {k} 最大误差 {spot_max_error*1000:.2f} um，剔除")
+        rejected_by_error += 1
+        continue
+
+    # =================================================
+    # 保存s
+    # =================================================
+    s_values.append(s.copy())
+
+
     errors.append(
         error_full
     )
     
     x_ref.append(xs[k,0])
-    y_ref.append(ys[k,0])
+    y_ref.append(ys[k,0])              #光斑第一帧的参考坐标
 
     xs_valid.append(xs[k].copy())
-    ys_valid.append(ys[k].copy())
+    ys_valid.append(ys[k].copy())      #光斑原始的26帧数轨迹
 
     centers.append(center)
     directions.append(direction)
@@ -564,6 +590,8 @@ np.savez(
 
     errors=np.array(errors),
 
+    s_values=np.array(s_values, dtype=np.float32),   # 新增
+
     
     heights=heights_mm
 
@@ -638,6 +666,10 @@ print(
 print(
     f"整体最大误差: "
     f"{max_error*1000:.3f} um"
+)
+
+print(
+    f"因最大误差>5um剔除的光斑数: {rejected_by_error}"
 )
 
 print("========================================")
