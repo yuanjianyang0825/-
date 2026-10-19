@@ -15,17 +15,14 @@ import matplotlib.pyplot as plt
 # 参数
 # =====================================================
 database_file = "spot_database.npz"
-sample_file = r"C:\Users\A\Desktop\硬币超分辨图\19.bmp"
-background_file = r"C:\Users\A\Desktop\硬币超分辨背景图\1.bmp"
+sample_file = r"C:\Users\A\Desktop\Image-Captured-At10-17-17-35-33\1.bmp"
+background_file = r"C:\Users\A\Desktop\Image-Captured-At10-17-18-02-56\1.bmp"
 
-roi_radius = 8
+roi_radius_x = 3   # x方向ROI半径
+roi_radius_y = 5   # y方向ROI半径
 threshold_abs = 35
 min_distance = 20
 
-BAD_PIXELS = [
-    (1207, 2750),
-    (373, 2688)
-]
 
 TRACK_HALF_LENGTH = 50.0
 TRACK_HALF_WIDTH = 1.2
@@ -37,13 +34,49 @@ def gauss_1d(x, A, mu, sigma, B):
     return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2) + B
 
 def fit_gauss_center(line):
+    """
+    对一维投影曲线进行高斯拟合，返回亚像素中心位置
+    采用自适应 sigma 初猜（加权标准差）
+    """
     x = np.arange(len(line), dtype=float)
+    total = np.sum(line)
+    
+    # 防呆处理：如果总强度为0，直接返回质心（或中点）作为保底
+    if total == 0:
+        return len(line) / 2.0
+
     try:
-        mu0 = np.sum(x * line) / np.sum(line)
-        p0 = [line.max() - line.min(), mu0, 2.0, line.min()]
-        p, _ = curve_fit(gauss_1d, x, line, p0=p0, maxfev=1000)
-        return p[1]
-    except:
+        # 1. 质心法计算 mu 初猜
+        mu0 = np.sum(x * line) / total
+        
+        # 2. ===== 核心改动：自适应计算 sigma 初猜 =====
+        # 计算加权二阶中心矩（即加权标准差）
+        sigma0 = np.sqrt(np.sum(line * (x - mu0) ** 2) / total)
+        
+        # 3. 安全保护：防止 sigma 极瘦（<0.1px）或极胖（>10px）或出现 NaN
+        if not np.isfinite(sigma0) or sigma0 < 0.1 or sigma0 > 10:
+            sigma0 = 2.0  # 极端情况下的保底值
+        
+        # 4. 构造初猜参数 [振幅, 中心, 标准差, 背景]
+        p0 = [
+            line.max() - line.min(),
+            mu0,
+            sigma0,          # 这里不再是固定的 2.0
+            line.min()
+        ]
+
+        # 5. 执行高斯拟合
+        popt, _ = curve_fit(
+            gauss_1d,
+            x,
+            line,
+            p0=p0,
+            maxfev=1000
+        )
+        return popt[1]  # 返回拟合出的中心 mu
+
+    except Exception:
+        # 如果拟合失败，退回到质心法（一阶矩）
         return center_of_mass(line)[0]
 
 # =====================================================
@@ -75,15 +108,6 @@ gray = img[:, :, 0].astype(np.float32)
 print("读取背景图...")
 bg = imageio.imread(background_file)
 background = bg[:, :, 0].astype(np.float32)
-
-for x, y in BAD_PIXELS:
-    roi = gray[y-1:y+2, x-1:x+2]
-    gray[y, x] = (np.sum(roi) - gray[y, x]) / 8
-
-for x, y in BAD_PIXELS:
-    roi = background[y-1:y+2, x-1:x+2]
-    background[y, x] = (np.sum(roi) - background[y, x]) / 8
-
 gray = gray - background
 gray[gray < 0] = 0
 H, W = gray.shape
@@ -142,10 +166,10 @@ ym = []
 
 print("亚像素定位...")
 for y0, x0 in coords:
-    y1 = max(int(y0) - roi_radius, 0)
-    y2 = min(int(y0) + roi_radius + 1, H)
-    x1 = max(int(x0) - roi_radius, 0)
-    x2 = min(int(x0) + roi_radius + 1, W)
+    y1 = max(int(y0) - roi_radius_y, 0)
+    y2 = min(int(y0) + roi_radius_y + 1, H)
+    x1 = max(int(x0) - roi_radius_x, 0)
+    x2 = min(int(x0) + roi_radius_x + 1, W)
     
     roi = gray[y1:y2, x1:x2]
     if roi.size == 0:
@@ -224,7 +248,8 @@ for k in range(N):
     )
 
 
-    z_correct = z_raw + error
+    # z_correct = z_raw + error
+    z_correct = z_raw
 
 
 
